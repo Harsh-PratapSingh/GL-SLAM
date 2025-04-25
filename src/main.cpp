@@ -6,6 +6,7 @@
 #include <sstream>
 
 const int num_images = 50;
+const int window_size = 5; // Sliding window size
 
 int main() {
     std::string dir_path = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/";
@@ -138,19 +139,64 @@ int main() {
                 gidx++;
             } else {
                 filtered_points++;
-                std::cout << "Filtered point " << k << ": camera coords (" 
-                         << x_coord << ", " << y_coord << ", " << z_coord << ")\n";
+                // std::cout << "Filtered point " << k << ": camera coords (" 
+                //          << x_coord << ", " << y_coord << ", " << z_coord << ")\n";
             }
         }
         std::cout << "Total points filtered by spatial bounds: " << filtered_points << "\n";
 
-        std::cout << "New points : " << points3D.size() - filtered_points << " \n";
+        std::cout << "New points: " << points3D.size() - filtered_points << " \n";
         std::cout << "Mask: " << points1.size() << " \n";
         std::cout << "Image " << i + 1 << ":\n";
         std::cout << "Estimated T: " << Ts_est[i + 1].t() << "\n";
         std::cout << "Ground Truth T: " << Ts_gt[i + 1].t() << "\n";
         std::cout << "Rotation Error: " << slam_core::compute_rotation_error(Rs_est[i + 1], Rs_gt[i + 1]) << " deg\n";
         std::cout << "Translation Error: " << slam_core::compute_translation_error(Ts_est[i + 1], Ts_gt[i + 1]) << " deg\n";
+        
+        
+        // Sliding window bundle adjustment
+        if (i >= window_size - 2) {
+            // Define the window: last window_size frames (i-window_size+1 to i+1)
+            std::vector<int> window_indices;
+            for (int j = std::max(0, i +2 - window_size); j <= i + 1; ++j) {
+                window_indices.push_back(j);
+            }
+            
+            
+            // Invert poses to world-to-camera for bundle adjustment
+            std::vector<cv::Mat> Rs_est_inv(window_indices.size());
+            std::vector<cv::Mat> Ts_est_inv(window_indices.size());
+            for (size_t k = 0; k < window_indices.size(); ++k) {
+                int idx = window_indices[k];
+                Rs_est_inv[k] = Rs_est[idx].t();
+                Ts_est_inv[k] = -Rs_est_inv[k] * Ts_est[idx]; // Corrected: Use Ts_est[idx]
+            }
+            
+            
+            // Perform bundle adjustment on the window
+            std::cout << "Running sliding window bundle adjustment for frames " << window_indices.front() << " to " << window_indices.back() << "...\n";
+            
+            slam_core::bundleAdjustment(Rs_est_inv, Ts_est_inv, global_points3D, K, window_indices);
+            std::cout << "Sliding window bundle adjustment completed.\n";
+
+
+            for (size_t k = 0; k < window_indices.size(); ++k) {
+                int idx = window_indices[k];
+                Rs_est[idx] = Rs_est_inv[k].t();
+                Ts_est[idx] = -Rs_est[idx] * Ts_est_inv[k]; // Corrected: Use Ts_est[idx]
+            }
+            // // Update global poses with optimized values (still in world-to-camera)
+            // for (int j : window_indices) {
+            //     Rs_est[j] = Rs_est_inv[j];
+            //     Ts_est[j] = Ts_est_inv[j];
+            // }
+
+            // // Invert back to camera-to-world for visualization and further processing
+            // for (int j : window_indices) {
+            //     Rs_est[j] = Rs_est[j].t();
+            //     Ts_est[j] = -Rs_est[j] * Ts_est[j];
+            // }
+        }
     }
 
     int p = 0;
@@ -164,25 +210,6 @@ int main() {
         }
     }
     std::cout << "points " << p << " in over 5 Camera\n";
-
-    // Invert poses to world-to-camera for bundle adjustment
-    std::vector<cv::Mat> Rs_est_inv(Rs_est.size());
-    std::vector<cv::Mat> Ts_est_inv(Ts_est.size());
-    for (size_t i = 0; i < Rs_est.size(); ++i) {
-        Rs_est_inv[i] = Rs_est[i].t();
-        Ts_est_inv[i] = -Rs_est_inv[i] * Ts_est[i];
-    }
-
-    // Perform bundle adjustment
-    std::cout << "Running bundle adjustment...\n";
-    slam_core::bundleAdjustment(Rs_est_inv, Ts_est_inv, global_points3D, K);
-    std::cout << "Bundle adjustment completed.\n";
-
-    // Invert optimized poses back to camera-to-world for visualization
-    for (size_t i = 0; i < Rs_est.size(); ++i) {
-        Rs_est[i] = Rs_est_inv[i].t();
-        Ts_est[i] = -Rs_est[i] * Ts_est_inv[i];
-    }
 
     // Compute reprojection errors
     double total_error = 0.0;

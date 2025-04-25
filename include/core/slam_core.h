@@ -28,7 +28,8 @@ namespace slam_core {
                       const cv::Mat& K, cv::Mat& R, cv::Mat& T);
 
     void bundleAdjustment(std::vector<cv::Mat>& Rs_est, std::vector<cv::Mat>& Ts_est,
-                         std::vector<Point3D>& points3D, const cv::Mat& K);
+                         std::vector<Point3D>& points3D, const cv::Mat& K,
+                         const std::vector<int>& window_indices);
 
     double compute_rotation_error(const cv::Mat& R_est, const cv::Mat& R_gt);
 
