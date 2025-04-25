@@ -1,0 +1,13 @@
+/.vscode
+/CMakeLists.txt
+/benchmarks
+/build
+/config
+/data
+/datasets
+/docs
+/left.jpeg
+/right.jpeg
+/scripts
+/tests
+/third_party
