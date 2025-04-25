@@ -1,11 +1,11 @@
 /.vscode
-/CMakeLists.txt
+# /CMakeLists.txt
 /benchmarks
 /build
 /config
 /data
 /datasets
-/docs
+# /docs
 /left.jpeg
 /right.jpeg
 /scripts
