@@ -1,0 +1,780 @@
+#include <opencv2/opencv.hpp>
+#include <pangolin/pangolin.h>
+#include "core/tensorrt_inference.h"
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <limits>
+#include <memory>
+
+// g2o includes
+#include <g2o/core/sparse_optimizer.h>
+#include <g2o/core/block_solver.h>
+#include <g2o/core/optimization_algorithm_levenberg.h>
+#include <g2o/solvers/eigen/linear_solver_eigen.h>
+#include <g2o/types/sba/types_six_dof_expmap.h>
+#include <g2o/types/sba/types_sba.h>
+#include <g2o/core/robust_kernel_impl.h>
+
+constexpr float SCORE_THRESHOLD = 0.99f;
+constexpr int IMAGE_WIDTH = 1241;
+constexpr int IMAGE_HEIGHT = 376;
+constexpr int MODEL_IMAGE_SIZE = 1024;
+
+cv::Mat load_calibration(const std::string& path) {
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.substr(0, 2) == "P0") {
+            std::istringstream iss(line.substr(4));
+            cv::Mat P0(3, 4, CV_64F);
+            for (int i = 0; i < 12; ++i) iss >> P0.at<double>(i / 4, i % 4);
+            return P0(cv::Rect(0, 0, 3, 3));
+        }
+    }
+    std::cerr << "P0 not found\n";
+    exit(-1);
+}
+
+std::vector<cv::Mat> load_poses(const std::string& path, int num_poses) {
+    std::ifstream file(path);
+    std::vector<cv::Mat> poses;
+    std::string line;
+    for (int i = 0; i < num_poses && std::getline(file, line); ++i) {
+        std::istringstream iss(line);
+        cv::Mat pose(3, 4, CV_64F);
+        for (int j = 0; j < 12; ++j) iss >> pose.at<double>(j / 4, j % 4);
+        poses.push_back(pose);
+    }
+    if (poses.size() < num_poses) {
+        std::cerr << "Failed to load " << num_poses << " poses\n";
+        exit(-1);
+    }
+    return poses;
+}
+
+void estimate_pose(const std::vector<cv::Point2f>& points1, const std::vector<cv::Point2f>& points2, const cv::Mat& K,
+                  cv::Mat& R, cv::Mat& T) {
+    cv::Mat mask;
+    cv::Mat E = cv::findEssentialMat(points1, points2, K, cv::RANSAC, 0.999, 1.0, mask);
+    cv::recoverPose(E, points1, points2, K, R, T, mask);
+    T = -R.t() * T;
+    R = R.inv();
+}
+
+double compute_rotation_error(const cv::Mat& R_est, const cv::Mat& R_gt) {
+    double trace = cv::trace(R_est.t() * R_gt)[0];
+    return acos(std::clamp((trace - 1.0) / 2.0, -1.0, 1.0)) * 180.0 / CV_PI;
+}
+
+double compute_translation_error(const cv::Mat& T_est, const cv::Mat& T_gt) {
+    cv::Mat T_est_3 = T_est(cv::Rect(0, 0, 1, 3));
+    cv::Mat T_gt_3 = T_gt(cv::Rect(0, 0, 1, 3));
+    double norm_est = cv::norm(T_est_3), norm_gt = cv::norm(T_gt_3);
+    if (norm_est == 0 || norm_gt == 0) return 0.0;
+    double cos_phi = T_est_3.dot(T_gt_3) / (norm_est * norm_gt);
+    return acos(std::clamp(cos_phi, -1.0, 1.0)) * 180.0 / CV_PI;
+}
+
+void draw_frustum(float scale, float r, float g, float b) {
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+    glColor3f(r, g, b);
+    float z = 0.8f * scale, s = 0.5f * scale;
+    glVertex3f(-s, -s, z); glVertex3f(s, -s, z);
+    glVertex3f(s, -s, z);  glVertex3f(s, s, z);
+    glVertex3f(s, s, z);   glVertex3f(-s, s, z);
+    glVertex3f(-s, s, z);  glVertex3f(-s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(-s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(s, s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(-s, s, z);
+    glEnd();
+}
+
+void visualize_poses(const std::vector<cv::Mat>& est_poses, const std::vector<cv::Mat>& gt_poses,
+                     const std::vector<cv::Point3d>& points3D_vec) {
+    pangolin::CreateWindowAndBind("Pose and Point Cloud Visualization", 1024, 768);
+    glEnable(GL_DEPTH_TEST);
+    pangolin::OpenGlRenderState s_cam(
+        pangolin::ProjectionMatrix(1024, 768, 500, 500, 512, 389, 0.1, 1000),
+        pangolin::ModelViewLookAt(0, -10, -20, 0, 0, 0, 0.0, -1.0, 0.0)
+    );
+    pangolin::View& d_cam = pangolin::CreateDisplay()
+        .SetBounds(0.0, 1.0, 0.0, 1.0, -1024.0f / 768.0f)
+        .SetHandler(new pangolin::Handler3D(s_cam));
+
+    // One-time debug print before rendering
+    std::vector<int> behind_counts_init(est_poses.size(), 0);
+    for (size_t i = 0; i < points3D_vec.size(); ++i) {
+        bool in_front = false;
+        std::vector<double> z_values(est_poses.size(), 0.0);
+        for (size_t j = 0; j < est_poses.size(); ++j) {
+            cv::Mat R = est_poses[j](cv::Rect(0, 0, 3, 3));
+            cv::Mat T = est_poses[j](cv::Rect(3, 0, 1, 3));
+            cv::Mat pt_world = (cv::Mat_<double>(3,1) << points3D_vec[i].x, points3D_vec[i].y, points3D_vec[i].z);
+            cv::Mat pt_cam = R.t() * (pt_world - T);
+            z_values[j] = pt_cam.at<double>(2);
+            if (z_values[j] > 0.01) {
+                in_front = true;
+            }
+        }
+        if (in_front) {
+            // Point will be plotted, no need to log unless behind somewhere
+        }
+        bool all_behind = true;
+        for (size_t j = 0; j < est_poses.size(); ++j) {
+            if (z_values[j] <= 0.01) {
+                behind_counts_init[j]++;
+                std::cout << "Point " << i << " behind Image " << j << ":\n";
+                std::cout << "  World coords: [" << points3D_vec[i].x << ", " << points3D_vec[i].y << ", " << points3D_vec[i].z << "]\n";
+                std::cout << "  Camera " << j << " Z: " << z_values[j] << "\n";
+                std::cout << "  In front: " << (in_front ? "yes" : "no") << "\n";
+            } else {
+                all_behind = false;
+            }
+        }
+        if (all_behind && behind_counts_init[0] > 0) {
+            std::cout << "Point " << i << " is behind all cameras:\n";
+            std::cout << "  World coords: [" << points3D_vec[i].x << ", " << points3D_vec[i].y << ", " << points3D_vec[i].z << "]\n";
+            for (size_t j = 0; j < est_poses.size(); ++j) {
+                std::cout << "  Camera " << j << " Z: " << z_values[j] << "\n";
+            }
+        }
+    }
+    // Print initial behind counts once
+    for (size_t j = 0; j < est_poses.size(); ++j) {
+        std::cout << "Initial Image " << j << ": " << behind_counts_init[j] << " points behind camera\n";
+    }
+
+    while (!pangolin::ShouldQuit()) {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        d_cam.Activate(s_cam);
+
+        glPointSize(2.0f);
+        glBegin(GL_POINTS);
+        glColor3f(0.0f, 1.0f, 0.0f); // Green points
+        std::vector<int> behind_counts(est_poses.size(), 0);
+        for (size_t i = 0; i < points3D_vec.size(); ++i) {
+            bool in_front = false;
+            std::vector<double> z_values(est_poses.size(), 0.0);
+            for (size_t j = 0; j < est_poses.size(); ++j) {
+                cv::Mat R = est_poses[j](cv::Rect(0, 0, 3, 3));
+                cv::Mat T = est_poses[j](cv::Rect(3, 0, 1, 3));
+                cv::Mat pt_world = (cv::Mat_<double>(3,1) << points3D_vec[i].x, points3D_vec[i].y, points3D_vec[i].z);
+                cv::Mat pt_cam = R.t() * (pt_world - T);
+                z_values[j] = pt_cam.at<double>(2);
+                if (z_values[j] > 0.01) {
+                    in_front = true;
+                }
+            }
+            if (in_front) {
+                glVertex3d(points3D_vec[i].x, points3D_vec[i].y, points3D_vec[i].z);
+            }
+            bool all_behind = true;
+            for (size_t j = 0; j < est_poses.size(); ++j) {
+                if (z_values[j] <= 0.01) {
+                    behind_counts[j]++;
+                } else {
+                    all_behind = false;
+                }
+            }
+        }
+        glEnd();
+
+        for (size_t i = 0; i < est_poses.size(); ++i) {
+            cv::Mat R = est_poses[i](cv::Rect(0, 0, 3, 3));
+            cv::Mat T = est_poses[i](cv::Rect(3, 0, 1, 3));
+            float T_mat[16] = {
+                float(R.at<double>(0,0)), float(R.at<double>(1,0)), float(R.at<double>(2,0)), 0,
+                float(R.at<double>(0,1)), float(R.at<double>(1,1)), float(R.at<double>(2,1)), 0,
+                float(R.at<double>(0,2)), float(R.at<double>(1,2)), float(R.at<double>(2,2)), 0,
+                float(T.at<double>(0)), float(T.at<double>(1)), float(T.at<double>(2)), 1
+            };
+            glPushMatrix();
+            glMultMatrixf(T_mat);
+            draw_frustum(1.0f, i == 0 ? 0.0f : 1.0f, 0.0f, i == 0 ? 1.0f : 0.0f);
+            glPopMatrix();
+        }
+
+        for (size_t i = 0; i < gt_poses.size(); ++i) {
+            cv::Mat R = gt_poses[i](cv::Rect(0, 0, 3, 3));
+            cv::Mat T = gt_poses[i](cv::Rect(3, 0, 1, 3));
+            float T_mat[16] = {
+                float(R.at<double>(0,0)), float(R.at<double>(1,0)), float(R.at<double>(2,0)), 0,
+                float(R.at<double>(0,1)), float(R.at<double>(1,1)), float(R.at<double>(2,1)), 0,
+                float(R.at<double>(0,2)), float(R.at<double>(1,2)), float(R.at<double>(2,2)), 0,
+                float(T.at<double>(0)), float(T.at<double>(1)), float(T.at<double>(2)), 1
+            };
+            glPushMatrix();
+            glMultMatrixf(T_mat);
+            draw_frustum(1.0f, 0.0f, 1.0f, 0.0f);
+            glPopMatrix();
+        }
+
+        pangolin::FinishFrame();
+    }
+    pangolin::DestroyWindow("Pose and Point Cloud Visualization");
+}
+
+void triangulate_points(const std::vector<cv::Point2f>& points1, const std::vector<cv::Point2f>& points2,
+                        const cv::Mat& P1, const cv::Mat& P2,
+                        std::vector<cv::Point3d>& points3D_vec, std::vector<int>& indices,
+                        std::vector<double>& depths) {
+    cv::Mat points1_mat(2, points1.size(), CV_64F), points2_mat(2, points2.size(), CV_64F);
+    for (size_t i = 0; i < points1.size(); ++i) {
+        points1_mat.at<double>(0,i) = points1[i].x; points1_mat.at<double>(1,i) = points1[i].y;
+        points2_mat.at<double>(0,i) = points2[i].x; points2_mat.at<double>(1,i) = points2[i].y;
+    }
+    cv::Mat points3D;
+    cv::triangulatePoints(P1, P2, points1_mat, points2_mat, points3D);
+    indices.resize(points1.size(), -1);
+    depths.resize(points1.size(), -1.0);
+    int valid_points = 0, filtered_points = 0;
+    for (int i = 0; i < points3D.cols; ++i) {
+        double w = points3D.at<double>(3,i);
+        if (w != 0) {
+            double z = points3D.at<double>(2,i)/w;
+            if (z > 0 && z < 100.0) {
+                points3D_vec.emplace_back(points3D.at<double>(0,i)/w, points3D.at<double>(1,i)/w, z);
+                indices[i] = points3D_vec.size() - 1;
+                depths[i] = z;
+                valid_points++;
+            } else {
+                filtered_points++;
+            }
+        }
+    }
+    std::cout << "Triangulation: " << valid_points << " valid points, " << filtered_points << " filtered (Z <= 0 or Z >= 150)\n";
+}
+
+void perform_bundle_adjustment(std::vector<cv::Mat>& poses, std::vector<cv::Point3d>& points3D_vec,
+                              const std::vector<std::vector<cv::Point2f>>& image_points,
+                              std::vector<std::vector<int>>& point_indices,
+                              const cv::Mat& K) {
+    
+
+    // // Pre-BA filtering: Remove points with Z <= 0.01 in any camera frame
+    // std::vector<cv::Point3d> new_points3D_vec;
+    // std::vector<bool> keep_point(points3D_vec.size(), true);
+    // int points_filtered = 0;
+    // for (size_t i = 0; i < points3D_vec.size(); ++i) {
+    //     cv::Point3d pt = points3D_vec[i];
+    //     bool keep = true;
+    //     for (size_t j = 0; j < poses.size(); ++j) {
+    //         cv::Mat R = poses[j](cv::Rect(0, 0, 3, 3));
+    //         cv::Mat T = poses[j](cv::Rect(3, 0, 1, 3));
+    //         cv::Mat pt_world = (cv::Mat_<double>(3,1) << pt.x, pt.y, pt.z);
+    //         cv::Mat pt_cam = R.t() * (pt_world - T);
+    //         double z = pt_cam.at<double>(2);
+    //         if (z <= 0.01) {
+    //             keep = false;
+    //             std::cout << "Pre-BA: Removing point " << i << ": [" << pt.x << ", " << pt.y << ", " << pt.z
+    //                       << "] (Camera " << j << " Z: " << z << ")\n";
+    //             break;
+    //         }
+    //     }
+    //     if (keep) {
+    //         new_points3D_vec.push_back(pt);
+    //         keep_point[i] = true;
+    //     } else {
+    //         keep_point[i] = false;
+    //         points_filtered++;
+    //     }
+    // }
+    // std::cout << "Pre-BA filtering: Removed " << points_filtered << " points behind cameras\n";
+
+    // // Create mapping from old to new indices
+    // std::vector<int> old_to_new(points3D_vec.size(), -1);
+    // int new_idx = 0;
+    // for (size_t i = 0; i < points3D_vec.size(); ++i) {
+    //     if (keep_point[i]) {
+    //         old_to_new[i] = new_idx++;
+    //     }
+    // }
+
+    // // Update point_indices
+    // std::cout << "Pre-BA point_indices sizes: ";
+    // for (size_t i = 0; i < point_indices.size(); ++i) {
+    //     std::cout << point_indices[i].size() << " ";
+    // }
+    // std::cout << "\n";
+    // std::vector<std::vector<int>> new_point_indices = point_indices;
+    // for (size_t i = 0; i < point_indices.size(); ++i) {
+    //     for (size_t j = 0; j < point_indices[i].size(); ++j) {
+    //         if (point_indices[i][j] >= 0) {
+    //             new_point_indices[i][j] = old_to_new[point_indices[i][j]];
+    //         }
+    //     }
+    // }
+
+    // // Update points3D_vec and point_indices
+    // points3D_vec = new_points3D_vec;
+    // point_indices = new_point_indices;
+
+    // std::cout << "Updated points3D_vec size: " << points3D_vec.size() << "\n";
+    // for (size_t i = 0; i < point_indices.size(); ++i) {
+    //     std::cout << "Updated point_indices[" << i << "] size: " << point_indices[i].size() << "\n";
+    // }
+
+    // Rest of perform_bundle_adjustment (g2o setup, BA, post-BA filter) unchanged
+    typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>> BlockSolverType;
+    typedef g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType> LinearSolverType;
+    auto solver = new g2o::OptimizationAlgorithmLevenberg(
+        std::make_unique<BlockSolverType>(std::make_unique<LinearSolverType>()));
+    g2o::SparseOptimizer optimizer;
+    optimizer.setAlgorithm(solver);
+    optimizer.setVerbose(true);
+
+
+
+    double fx = K.at<double>(0, 0);
+    double fy = K.at<double>(1, 1);
+    double cx = K.at<double>(0, 2);
+    double cy = K.at<double>(1, 2);
+
+    std::vector<g2o::VertexSE3Expmap*> pose_vertices;
+    std::cout << "Initial poses for g2o (camera-to-world):\n";
+    for (size_t i = 0; i < poses.size(); ++i) {
+        cv::Mat R = poses[i](cv::Rect(0, 0, 3, 3));
+        cv::Mat T = poses[i](cv::Rect(3, 0, 1, 3));
+        cv::Mat R_inv = R.t();
+        cv::Mat T_inv = -R_inv * T;
+        Eigen::Matrix3d R_eigen;
+        Eigen::Vector3d T_eigen;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                R_eigen(r, c) = R_inv.at<double>(r, c);
+            }
+            T_eigen(r) = T_inv.at<double>(r, 0);
+        }
+        g2o::SE3Quat pose(R_eigen, T_eigen);
+        g2o::VertexSE3Expmap* v_se3 = new g2o::VertexSE3Expmap();
+        v_se3->setId(i);
+        v_se3->setEstimate(pose);
+        if (i == 0) {
+            v_se3->setFixed(true);
+        }
+        optimizer.addVertex(v_se3);
+        pose_vertices.push_back(v_se3);
+        std::cout << "Image " << i << ": T = [" << T_eigen.x() << ", " << T_eigen.y() << ", " << T_eigen.z() << "]\n";
+    }
+
+    std::vector<g2o::VertexPointXYZ*> point_vertices;
+    double min_z = std::numeric_limits<double>::max();
+    double max_z = std::numeric_limits<double>::min();
+    double sum_z = 0.0;
+    int z_count = 0;
+    for (size_t i = 0; i < points3D_vec.size(); ++i) {
+        g2o::VertexPointXYZ* v_point = new g2o::VertexPointXYZ();
+        v_point->setId(poses.size() + i);
+        v_point->setEstimate(Eigen::Vector3d(points3D_vec[i].x, points3D_vec[i].y, points3D_vec[i].z));
+        v_point->setMarginalized(true);
+        optimizer.addVertex(v_point);
+        point_vertices.push_back(v_point);
+        double z = points3D_vec[i].z;
+        if (z > 0) {
+            min_z = std::min(min_z, z);
+            max_z = std::max(max_z, z);
+            sum_z += z;
+            z_count++;
+        }
+    }
+    std::cout << "3D points Z-depth: min=" << min_z << ", max=" << max_z << ", avg=" << (z_count > 0 ? sum_z / z_count : 0) << "\n";
+
+    int edge_count = 0;
+    double initial_error = 0.0;
+    int outlier_edges = 0;
+    double sum_weight = 0.0;
+    g2o::CameraParameters* camera = new g2o::CameraParameters(fx, Eigen::Vector2d(cx, cy), 0);
+    camera->setId(0);
+    optimizer.addParameter(camera);
+    for (size_t i = 0; i < image_points.size(); ++i) {
+        for (size_t j = 0; j < image_points[i].size(); ++j) {
+            int point_idx = point_indices[i][j];
+            if (point_idx >= 0) {
+                g2o::EdgeProjectXYZ2UV* edge = new g2o::EdgeProjectXYZ2UV();
+                edge->setVertex(0, point_vertices[point_idx]);
+                edge->setVertex(1, pose_vertices[i]);
+                edge->setMeasurement(Eigen::Vector2d(image_points[i][j].x, image_points[i][j].y));
+                double z = points3D_vec[point_idx].z;
+                double weight = (z > 0.1) ? 1.0 / (z * z) : 1.0 / (0.1 * 0.1);
+                Eigen::Matrix2d info = Eigen::Matrix2d::Identity() * weight;
+                edge->setInformation(info);
+                edge->setParameterId(0, 0);
+                edge->setRobustKernel(new g2o::RobustKernelHuber());
+                edge->robustKernel()->setDelta(3.0);
+                optimizer.addEdge(edge);
+                edge_count++;
+                edge->computeError();
+                double chi2 = edge->chi2();
+                initial_error += chi2;
+                if (chi2 > 25.0) {
+                    outlier_edges++;
+                }
+                sum_weight += weight;
+            }
+        }
+    }
+
+    std::cout << "Bundle Adjustment Setup:\n";
+    std::cout << "Pose vertices: " << pose_vertices.size() << "\n";
+    std::cout << "Point vertices: " << point_vertices.size() << "\n";
+    std::cout << "Reprojection edges: " << edge_count << "\n";
+    std::cout << "Initial reprojection error: " << initial_error << " (chi2)\n";
+    std::cout << "Initial avg error per edge: " << (edge_count > 0 ? initial_error / edge_count : 0) << " (chi2/edge)\n";
+    std::cout << "Initial outlier edges (>25 chi2): " << outlier_edges << " (" << (edge_count > 0 ? 100.0 * outlier_edges / edge_count : 0) << "%)\n";
+    std::cout << "Avg edge weight: " << (edge_count > 0 ? sum_weight / edge_count : 0) << "\n";
+
+    optimizer.initializeOptimization();
+    optimizer.optimize(50);
+
+    double final_error = 0.0;
+    outlier_edges = 0;
+    for (auto* e : optimizer.edges()) {
+        auto* edge = dynamic_cast<g2o::EdgeProjectXYZ2UV*>(e);
+        edge->computeError();
+        double chi2 = edge->chi2();
+        if (edge->robustKernel()) {
+            Eigen::Vector3d rho;
+            edge->robustKernel()->robustify(chi2, rho);
+            chi2 = rho[0];
+        }
+        final_error += chi2;
+        if (chi2 > 25.0) {
+            outlier_edges++;
+        }
+    }
+
+    std::cout << "Final reprojection error: " << final_error << " (chi2, Huber-weighted)\n";
+    std::cout << "Final avg error per edge: " << (edge_count > 0 ? final_error / edge_count : 0) << " (chi2/edge)\n";
+    std::cout << "Final outlier edges (>25 chi2): " << outlier_edges << " (" << (edge_count > 0 ? 100.0 * outlier_edges / edge_count : 0) << "%)\n";
+    std::cout << "Pose translations after BA (world-to-camera):\n";
+    for (size_t i = 0; i < pose_vertices.size(); ++i) {
+        g2o::SE3Quat pose = pose_vertices[i]->estimate();
+        Eigen::Matrix3d R_eigen = pose.rotation().toRotationMatrix();
+        Eigen::Vector3d T_eigen = pose.translation();
+        Eigen::Matrix3d R_inv = R_eigen.transpose();
+        Eigen::Vector3d T_inv = -R_inv * T_eigen;
+        std::cout << "Image " << i << ": [" << T_inv.x() << ", " << T_inv.y() << ", " << T_inv.z() << "]\n";
+    }
+
+    // Update poses
+    for (size_t i = 0; i < poses.size(); ++i) {
+        g2o::SE3Quat pose = pose_vertices[i]->estimate();
+        Eigen::Matrix3d R_eigen = pose.rotation().toRotationMatrix();
+        Eigen::Vector3d T_eigen = pose.translation();
+        Eigen::Matrix3d R_inv = R_eigen.transpose();
+        Eigen::Vector3d T_inv = -R_inv * T_eigen;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                poses[i].at<double>(r, c) = R_inv(r, c);
+            }
+            poses[i].at<double>(r, 3) = T_inv(r);
+        }
+    }
+
+    // // Filter points post-BA that are behind any camera
+    // std::vector<cv::Point3d> new_points3D_vec;
+    // std::vector<bool> keep_point(points3D_vec.size(), true);
+    // int points_filtered = 0;
+    // for (size_t i = 0; i < points3D_vec.size(); ++i) {
+    //     Eigen::Vector3d pt = Eigen::Vector3d(points3D_vec[i].x, points3D_vec[i].y, points3D_vec[i].z);
+    //     cv::Point3d temp_pt(pt.x(), pt.y(), pt.z());
+    //     bool keep = true;
+    //     for (size_t j = 0; j < poses.size(); ++j) {
+    //         cv::Mat R = poses[j](cv::Rect(0, 0, 3, 3));
+    //         cv::Mat T = poses[j](cv::Rect(3, 0, 1, 3));
+    //         cv::Mat pt_world = (cv::Mat_<double>(3,1) << temp_pt.x, temp_pt.y, temp_pt.z);
+    //         cv::Mat pt_cam = R.t() * (pt_world - T);
+    //         double z = pt_cam.at<double>(2);
+    //         if (z <= 0.01) {
+    //             keep = false;
+    //             std::cout << "Removing point " << i << ": [" << temp_pt.x << ", " << temp_pt.y << ", " << temp_pt.z << "] (Camera " << j << " Z: " << z << ")\n";
+    //             break;
+    //         }
+    //     }
+    //     if (keep) {
+    //         new_points3D_vec.push_back(temp_pt);
+    //         keep_point[i] = true;
+    //     } else {
+    //         keep_point[i] = false;
+    //         points_filtered++;
+    //     }
+    // }
+    // std::cout << "Post-BA filtering: Removed " << points_filtered << " points behind cameras\n";
+
+    // // Create mapping from old to new indices
+    // old_to_new(points3D_vec.size(), -1);
+    // new_idx = 0;
+    // for (size_t i = 0; i < points3D_vec.size(); ++i) {
+    //     if (keep_point[i]) {
+    //         old_to_new[i] = new_idx++;
+    //     }
+    // }
+
+    // // Update point_indices
+    // std::cout << "Old point_indices sizes: ";
+    // for (size_t i = 0; i < point_indices.size(); ++i) {
+    //     std::cout << point_indices[i].size() << " ";
+    // }
+    // std::cout << "\n";
+    // new_point_indices = point_indices;
+    // for (size_t i = 0; i < point_indices.size(); ++i) {
+    //     for (size_t j = 0; j < point_indices[i].size(); ++j) {
+    //         if (point_indices[i][j] >= 0) {
+    //             new_point_indices[i][j] = old_to_new[point_indices[i][j]];
+    //         }
+    //     }
+    // }
+
+    // // Update points3D_vec and point_indices
+    // points3D_vec = new_points3D_vec;
+    // point_indices = new_point_indices;
+
+    // std::cout << "Updated points3D_vec size: " << points3D_vec.size() << "\n";
+    // for (size_t i = 0; i < point_indices.size(); ++i) {
+    //     std::cout << "Updated point_indices[" << i << "] size: " << point_indices[i].size() << "\n";
+    // }
+
+    // Clear our vertex tracking vectors (optimizer handles vertex deletion)
+    pose_vertices.clear();
+    point_vertices.clear();
+
+    std::cout << "Finished BA optimization, about to destroy optimizer\n";
+}
+
+int main() {
+    std::string dir_path = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/";
+    TensorRTInference infer("../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt.onnx",
+                            "../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt");
+
+    cv::Mat K = load_calibration(dir_path + "calib.txt");
+    float scale_x = float(IMAGE_WIDTH) / MODEL_IMAGE_SIZE;
+    float scale_y = float(IMAGE_HEIGHT) / MODEL_IMAGE_SIZE;
+
+    std::vector<cv::Mat> poses;
+    std::vector<cv::Point3d> points3D_vec;
+    std::vector<std::vector<cv::Point2f>> image_points;
+    std::vector<std::vector<int>> point_indices;
+    std::vector<std::vector<double>> point_depths;
+
+    auto gt_poses = load_poses(dir_path + "00.txt", 4);
+
+    std::vector<int64_t> keypoints, matches;
+    std::vector<float> scores;
+    infer.runInference(dir_path + "image_0/000000.png", dir_path + "image_0/000001.png", keypoints, matches, scores);
+    std::vector<cv::Point2f> points0, points1;
+    for (size_t m = 0; m < scores.size() && m * 3 + 2 < matches.size(); ++m) {
+        if (scores[m] >= SCORE_THRESHOLD && matches[m * 3] == 0) {
+            int left_idx = matches[m * 3 + 1], right_idx = matches[m * 3 + 2];
+            if (left_idx >= 0 && left_idx < MODEL_IMAGE_SIZE && right_idx >= 0 && right_idx < MODEL_IMAGE_SIZE) {
+                points0.emplace_back(keypoints[left_idx * 2] * scale_x, keypoints[left_idx * 2 + 1] * scale_y);
+                points1.emplace_back(keypoints[MODEL_IMAGE_SIZE * 2 + right_idx * 2] * scale_x,
+                                   keypoints[MODEL_IMAGE_SIZE * 2 + right_idx * 2 + 1] * scale_y);
+            }
+        }
+    }
+    std::cout << "Matches 0-1: " << points0.size() << "\n";
+
+    cv::Mat R_est, T_est;
+    estimate_pose(points0, points1, K, R_est, T_est);
+
+    poses.push_back(cv::Mat::eye(3, 4, CV_64F));
+    cv::Mat P1(3, 4, CV_64F);
+    R_est.copyTo(P1(cv::Rect(0, 0, 3, 3)));
+    T_est.copyTo(P1(cv::Rect(3, 0, 1, 3)));
+    poses.push_back(P1);
+
+    cv::Mat P0 = K * cv::Mat::eye(3, 4, CV_64F);
+    cv::Mat P1_proj(3, 4, CV_64F);
+    cv::Mat R_rel = R_est.t();
+    cv::Mat T_rel = -R_rel * T_est;
+    R_rel.copyTo(P1_proj(cv::Rect(0, 0, 3, 3)));
+    T_rel.copyTo(P1_proj(cv::Rect(3, 0, 1, 3)));
+    P1_proj = K * P1_proj;
+    std::vector<int> indices0;
+    std::vector<double> depths0;
+    triangulate_points(points0, points1, P0, P1_proj, points3D_vec, indices0, depths0);
+    image_points.push_back(points0);
+    image_points.push_back(points1);
+    point_indices.push_back(indices0);
+    point_indices.push_back(indices0);
+    point_depths.push_back(depths0);
+    point_depths.push_back(depths0);
+
+    std::vector<int64_t> keypoints12, matches12;
+    std::vector<float> scores12;
+    infer.runInference(dir_path + "image_0/000001.png", dir_path + "image_0/000002.png", keypoints12, matches12, scores12);
+    std::vector<cv::Point2f> points1_second, points2_second;
+    for (size_t m = 0; m < scores12.size() && m * 3 + 2 < matches12.size(); ++m) {
+        if (scores12[m] >= SCORE_THRESHOLD && matches12[m * 3] == 0) {
+            int left_idx = matches12[m * 3 + 1], right_idx = matches12[m * 3 + 2];
+            if (left_idx >= 0 && left_idx < MODEL_IMAGE_SIZE && right_idx >= 0 && right_idx < MODEL_IMAGE_SIZE) {
+                points1_second.emplace_back(keypoints12[left_idx * 2] * scale_x, keypoints12[left_idx * 2 + 1] * scale_y);
+                points2_second.emplace_back(keypoints12[MODEL_IMAGE_SIZE * 2 + right_idx * 2] * scale_x,
+                                         keypoints12[MODEL_IMAGE_SIZE * 2 + right_idx * 2 + 1] * scale_y);
+            }
+        }
+    }
+    std::cout << "Matches 1-2: " << points1_second.size() << "\n";
+
+    std::vector<cv::Point3d> points3D_for_pnp;
+    std::vector<cv::Point2f> points2_for_pnp;
+    std::vector<int> indices2(points2_second.size(), -1);
+    for (size_t m = 0; m < points1_second.size(); ++m) {
+        double min_dist = std::numeric_limits<double>::max();
+        int best_idx = -1;
+        for (size_t i = 0; i < image_points[1].size(); ++i) {
+            double dist = cv::norm(image_points[1][i] - points1_second[m]);
+            if (dist < min_dist) { min_dist = dist; best_idx = i; }
+        }
+        if (min_dist < 0.5 && best_idx >= 0 && point_indices[1][best_idx] >= 0) {
+            int map_idx = point_indices[1][best_idx];
+            points3D_for_pnp.push_back(points3D_vec[map_idx]);
+            points2_for_pnp.push_back(points2_second[m]);
+            indices2[m] = map_idx;
+        }
+    }
+
+    cv::Mat rvec, tvec;
+    cv::Mat inliers;
+    cv::solvePnPRansac(points3D_for_pnp, points2_for_pnp, K, cv::Mat(), rvec, tvec, false, 100, 2.0, 0.95, inliers);
+    std::cout << "PnP Image 2: " << inliers.rows << " inliers\n";
+    cv::Mat R_pnp; cv::Rodrigues(rvec, R_pnp);
+    cv::Mat R_pnp_inv = R_pnp.t();
+    cv::Mat T_pnp_inv = -R_pnp_inv * tvec;
+    cv::Mat P2(3, 4, CV_64F);
+    R_pnp_inv.copyTo(P2(cv::Rect(0, 0, 3, 3)));
+    T_pnp_inv.copyTo(P2(cv::Rect(3, 0, 1, 3)));
+    poses.push_back(P2);
+
+    std::vector<cv::Point2f> new_points1, new_points2;
+    for (size_t m = 0; m < points1_second.size(); ++m) {
+        if (indices2[m] == -1) {
+            new_points1.push_back(points1_second[m]);
+            new_points2.push_back(points2_second[m]);
+        }
+    }
+    if (!new_points1.empty()) {
+        std::vector<int> new_indices;
+        std::vector<double> new_depths;
+        triangulate_points(new_points1, new_points2, K * poses[1], K * P2, points3D_vec, new_indices, new_depths);
+        for (size_t i = 0; i < new_indices.size(); ++i) {
+            if (new_indices[i] >= 0) {
+                for (size_t m = 0; m < points1_second.size(); ++m) {
+                    if (points1_second[m] == new_points1[i]) {
+                        indices2[m] = new_indices[i];
+                        break;
+                    }
+                }
+            }
+        }
+        point_depths.push_back(new_depths);
+    }
+    image_points.push_back(points2_second);
+    point_indices.push_back(indices2);
+
+    std::vector<int64_t> keypoints23, matches23;
+    std::vector<float> scores23;
+    infer.runInference(dir_path + "image_0/000002.png", dir_path + "image_0/000003.png", keypoints23, matches23, scores23);
+    std::vector<cv::Point2f> points2_third, points3_third;
+    for (size_t m = 0; m < scores23.size() && m * 3 + 2 < matches23.size(); ++m) {
+        if (scores23[m] >= SCORE_THRESHOLD && matches23[m * 3] == 0) {
+            int left_idx = matches23[m * 3 + 1], right_idx = matches23[m * 3 + 2];
+            if (left_idx >= 0 && left_idx < MODEL_IMAGE_SIZE && right_idx >= 0 && right_idx < MODEL_IMAGE_SIZE) {
+                points2_third.emplace_back(keypoints23[left_idx * 2] * scale_x, keypoints23[left_idx * 2 + 1] * scale_y);
+                points3_third.emplace_back(keypoints23[MODEL_IMAGE_SIZE * 2 + right_idx * 2] * scale_x,
+                                         keypoints23[MODEL_IMAGE_SIZE * 2 + right_idx * 2 + 1] * scale_y);
+            }
+        }
+    }
+    std::cout << "Matches 2-3: " << points2_third.size() << "\n";
+
+    std::vector<cv::Point3d> points3D_for_pnp3;
+    std::vector<cv::Point2f> points3_for_pnp;
+    std::vector<int> indices3(points3_third.size(), -1);
+    for (size_t m = 0; m < points2_third.size(); ++m) {
+        double min_dist = std::numeric_limits<double>::max();
+        int best_idx = -1;
+        for (size_t i = 0; i < image_points[2].size(); ++i) {
+            double dist = cv::norm(image_points[2][i] - points2_third[m]);
+            if (dist < min_dist) { min_dist = dist; best_idx = i; }
+        }
+        if (min_dist < 0.5 && best_idx >= 0 && point_indices[2][best_idx] >= 0) {
+            int map_idx = point_indices[2][best_idx];
+            points3D_for_pnp3.push_back(points3D_vec[map_idx]);
+            points3_for_pnp.push_back(points3_third[m]);
+            indices3[m] = map_idx;
+        }
+    }
+
+    cv::Mat rvec3, tvec3;
+    cv::Mat inliers3;
+    cv::solvePnPRansac(points3D_for_pnp3, points3_for_pnp, K, cv::Mat(), rvec3, tvec3, false, 100, 2.0, 0.95, inliers3);
+    std::cout << "PnP Image 3: " << inliers3.rows << " inliers\n";
+    cv::Mat R_pnp3; cv::Rodrigues(rvec3, R_pnp3);
+    cv::Mat R_pnp_inv3 = R_pnp3.t();
+    cv::Mat T_pnp_inv3 = -R_pnp_inv3 * tvec3;
+    cv::Mat P3(3, 4, CV_64F);
+    R_pnp_inv3.copyTo(P3(cv::Rect(0, 0, 3, 3)));
+    T_pnp_inv3.copyTo(P3(cv::Rect(3, 0, 1, 3)));
+    poses.push_back(P3);
+
+    std::vector<cv::Point2f> new_points2_third, new_points3_third;
+    for (size_t m = 0; m < points2_third.size(); ++m) {
+        if (indices3[m] == -1) {
+            new_points2_third.push_back(points2_third[m]);
+            new_points3_third.push_back(points3_third[m]);
+        }
+    }
+    if (!new_points2_third.empty()) {
+        std::vector<int> new_indices;
+        std::vector<double> new_depths;
+        triangulate_points(new_points2_third, new_points3_third, K * poses[2], K * P3, points3D_vec, new_indices, new_depths);
+        for (size_t i = 0; i < new_indices.size(); ++i) {
+            if (new_indices[i] >= 0) {
+                for (size_t m = 0; m < points2_third.size(); ++m) {
+                    if (points2_third[m] == new_points2_third[i]) {
+                        indices3[m] = new_indices[i];
+                        break;
+                    }
+                }
+            }
+        }
+        point_depths.push_back(new_depths);
+    }
+    image_points.push_back(points3_third);
+    point_indices.push_back(indices3);
+
+    for (size_t i = 0; i < poses.size(); ++i) {
+        cv::Mat R = poses[i](cv::Rect(0, 0, 3, 3));
+        cv::Mat T = poses[i](cv::Rect(3, 0, 1, 3));
+        cv::Mat R_gt = gt_poses[i](cv::Rect(0, 0, 3, 3));
+        cv::Mat T_gt = gt_poses[i](cv::Rect(3, 0, 1, 3));
+        std::cout << "Image " << i << " (before BA):\n";
+        std::cout << "Estimated T: " << T.t() << "\n";
+        std::cout << "Ground Truth T: " << T_gt.t() << "\n";
+        std::cout << "Rotation Error: " << compute_rotation_error(R, R_gt) << " deg\n";
+        std::cout << "Translation Error: " << compute_translation_error(T, T_gt) << " deg\n\n";
+    }
+
+    perform_bundle_adjustment(poses, points3D_vec, image_points, point_indices, K);
+
+    for (size_t i = 0; i < poses.size(); ++i) {
+        cv::Mat R = poses[i](cv::Rect(0, 0, 3, 3));
+        cv::Mat T = poses[i](cv::Rect(3, 0, 1, 3));
+        cv::Mat R_gt = gt_poses[i](cv::Rect(0, 0, 3, 3));
+        cv::Mat T_gt = gt_poses[i](cv::Rect(3, 0, 1, 3));
+        std::cout << "Image " << i << " (after BA):\n";
+        std::cout << "Estimated T: " << T.t() << "\n";
+        std::cout << "Ground Truth T: " << T_gt.t() << "\n";
+        std::cout << "Rotation Error: " << compute_rotation_error(R, R_gt) << " deg\n";
+        std::cout << "Translation Error: " << compute_translation_error(T, T_gt) << " deg\n\n";
+    }
+
+    std::cout << "Total 3D points: " << points3D_vec.size() << "\n";
+
+    visualize_poses(poses, gt_poses, points3D_vec);
+    return 0;
+}

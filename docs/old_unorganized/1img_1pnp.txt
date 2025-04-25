@@ -1,0 +1,377 @@
+#include <opencv2/opencv.hpp>
+#include <pangolin/pangolin.h>
+#include "core/tensorrt_inference.h"
+#include <iostream>
+#include <iomanip>
+
+constexpr float SCORE_THRESHOLD = 0.99f;
+constexpr int IMAGE_WIDTH = 1241;
+constexpr int IMAGE_HEIGHT = 376;
+constexpr int MODEL_IMAGE_SIZE = 1024;
+
+// Function to triangulate 3D points from two camera views
+// Inputs:
+// - K: Camera intrinsic matrix (3x3, CV_64F)
+// - R1, T1: Rotation (3x3, CV_64F) and translation (3x1, CV_64F) of camera 1
+// - R2, T2: Rotation (3x3, CV_64F) and translation (3x1, CV_64F) of camera 2
+// - points1, points2: 2D points in images from camera 1 and 2 (std::vector<cv::Point2f>)
+// - mask: Inlier mask from pose estimation (cv::Mat, CV_8U)
+// Output:
+// - 3D points in the world coordinate system (std::vector<cv::Point3f>)
+std::vector<cv::Point3f> triangulatePoints(const cv::Mat& K, const cv::Mat& R1, const cv::Mat& T1, 
+                                           const cv::Mat& R2, const cv::Mat& T2, 
+                                           const std::vector<cv::Point2f>& points1, 
+                                           const std::vector<cv::Point2f>& points2, 
+                                           const cv::Mat& mask) {
+    // Invert extrinsic matrices: [R|T]^(-1) = [R.t()|-R.t()*T]
+    cv::Mat R1_inv = R1.t();
+    cv::Mat T1_inv = -R1_inv * T1;
+    cv::Mat R2_inv = R2.t();
+    cv::Mat T2_inv = -R2_inv * T2;
+
+    // Form projection matrices P = K * [R|T] using inverted extrinsics
+    cv::Mat P1_ext, P2_ext;
+    cv::hconcat(R1_inv, T1_inv, P1_ext);
+    cv::Mat P1 = K * P1_ext;
+    P1.convertTo(P1, CV_32F);
+    cv::hconcat(R2_inv, T2_inv, P2_ext);
+    cv::Mat P2 = K * P2_ext;
+    P2.convertTo(P2, CV_32F);
+
+    // Filter inlier points using the mask
+    std::vector<cv::Point2f> points1_inlier, points2_inlier;
+    for (size_t i = 0; i < points1.size(); ++i) {
+        if (mask.at<uchar>(i)) {
+            points1_inlier.push_back(points1[i]);
+            points2_inlier.push_back(points2[i]);
+        }
+    }
+
+    // Triangulate to get 3D points in homogeneous coordinates
+    cv::Mat points4D;
+    cv::triangulatePoints(P1, P2, points1_inlier, points2_inlier, points4D);
+
+    // Convert homogeneous coordinates to 3D Cartesian coordinates
+    std::vector<cv::Point3f> points3D;
+    for (int i = 0; i < points4D.cols; ++i) {
+        cv::Mat x = points4D.col(i);
+        x /= x.at<float>(3); // Normalize by the homogeneous coordinate
+        points3D.emplace_back(x.at<float>(0), x.at<float>(1), x.at<float>(2));
+    }
+
+    // Filter points based on depth in both camera coordinate systems
+    std::vector<cv::Point3f> filtered_points3D;
+    for (const auto& pt : points3D) {
+        // Convert 3D point to a column vector
+        cv::Mat X = (cv::Mat_<double>(3,1) << pt.x, pt.y, pt.z);
+        
+        // Transform to camera coordinates: X_cam = R * X_world + T
+        cv::Mat X_cam1 = R1 * X + T1;
+        cv::Mat X_cam2 = R2 * X + T2;
+        
+        // Extract Z-coordinates (depth)
+        double Z1 = X_cam1.at<double>(2);
+        double Z2 = X_cam2.at<double>(2);
+        
+        // Keep points where Z > 0 and Z <= 40 in both camera views
+        if (Z1 > 0 && Z1 <= 60 && Z2 > 0 && Z2 <= 60) {
+            filtered_points3D.push_back(pt);
+        }
+    }
+
+    return filtered_points3D;
+}
+
+cv::Mat load_calibration(const std::string& path) {
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.substr(0, 2) == "P0") {
+            std::istringstream iss(line.substr(4));
+            cv::Mat P0(3, 4, CV_64F);
+            for (int i = 0; i < 12; ++i) iss >> P0.at<double>(i / 4, i % 4);
+            return P0(cv::Rect(0, 0, 3, 3));
+        }
+    }
+    std::cerr << "P0 not found\n";
+    exit(-1);
+}
+
+std::vector<cv::Mat> load_poses(const std::string& path, int num_poses) {
+    std::ifstream file(path);
+    std::vector<cv::Mat> poses;
+    std::string line;
+    for (int i = 0; i < num_poses && std::getline(file, line); ++i) {
+        std::istringstream iss(line);
+        cv::Mat pose(3, 4, CV_64F);
+        for (int j = 0; j < 12; ++j) iss >> pose.at<double>(j / 4, j % 4);
+        poses.push_back(pose);
+    }
+    if (poses.size() < num_poses) {
+        std::cerr << "Failed to load " << num_poses << " poses\n";
+        exit(-1);
+    }
+    return poses;
+}
+
+void estimate_pose(const std::vector<cv::Point2f>& points1, const std::vector<cv::Point2f>& points2, const cv::Mat& K,
+                  cv::Mat& R, cv::Mat& T) {
+    cv::Mat mask;
+    cv::Mat E = cv::findEssentialMat(points1, points2, K, cv::RANSAC, 0.999, 1.0, mask);
+    cv::recoverPose(E, points1, points2, K, R, T, mask);
+    R = R.t();
+    T = -R * T;
+}
+
+double compute_rotation_error(const cv::Mat& R_est, const cv::Mat& R_gt) {
+    double trace = cv::trace(R_est.t() * R_gt)[0];
+    return acos(std::clamp((trace - 1.0) / 2.0, -1.0, 1.0)) * 180.0 / CV_PI;
+}
+
+double compute_translation_error(const cv::Mat& T_est, const cv::Mat& T_gt) {
+    cv::Mat T_est_3 = T_est(cv::Rect(0, 0, 1, 3));
+    cv::Mat T_gt_3 = T_gt(cv::Rect(0, 0, 1, 3));
+    double cos_phi = T_est_3.dot(T_gt_3) / (cv::norm(T_est_3) * cv::norm(T_gt_3));
+    return acos(std::clamp(cos_phi, -1.0, 1.0)) * 180.0 / CV_PI;
+}
+
+void draw_frustum(float scale, float r, float g, float b) {
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+    glColor3f(r, g, b);
+    float z = 0.8f * scale, s = 0.5f * scale;
+    glVertex3f(-s, -s, z); glVertex3f(s, -s, z);
+    glVertex3f(s, -s, z);  glVertex3f(s, s, z);
+    glVertex3f(s, s, z);   glVertex3f(-s, s, z);
+    glVertex3f(-s, s, z);  glVertex3f(-s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(-s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(s, s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(-s, s, z);
+    glEnd();
+}
+
+// Visualize camera poses and triangulated 3D points
+void visualize_poses(const std::vector<cv::Mat>& Rs_est, const std::vector<cv::Mat>& Ts_est, 
+                     const std::vector<cv::Mat>& Rs_gt, const std::vector<cv::Mat>& Ts_gt,
+                     const std::vector<cv::Point3f>& points3D) {
+    pangolin::CreateWindowAndBind("Pose Visualization", 1024, 768);
+    glEnable(GL_DEPTH_TEST);
+    pangolin::OpenGlRenderState s_cam(
+        pangolin::ProjectionMatrix(1024, 768, 500, 500, 512, 389, 0.1, 1000),
+        pangolin::ModelViewLookAt(0, -10, -20, 0, 0, 0, 0.0, -1.0, 0.0)
+    );
+    pangolin::View& d_cam = pangolin::CreateDisplay()
+        .SetBounds(0.0, 1.0, 0.0, 1.0, -1024.0f / 768.0f)
+        .SetHandler(new pangolin::Handler3D(s_cam));
+
+    while (!pangolin::ShouldQuit()) {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        d_cam.Activate(s_cam);
+
+        // Draw estimated poses in red
+        for (size_t i = 0; i < Rs_est.size(); ++i) {
+            float T_est_mat[16] = {
+                float(Rs_est[i].at<double>(0,0)), float(Rs_est[i].at<double>(1,0)), float(Rs_est[i].at<double>(2,0)), 0,
+                float(Rs_est[i].at<double>(0,1)), float(Rs_est[i].at<double>(1,1)), float(Rs_est[i].at<double>(2,1)), 0,
+                float(Rs_est[i].at<double>(0,2)), float(Rs_est[i].at<double>(1,2)), float(Rs_est[i].at<double>(2,2)), 0,
+                float(Ts_est[i].at<double>(0)), float(Ts_est[i].at<double>(1)), float(Ts_est[i].at<double>(2)), 1
+            };
+            glPushMatrix();
+            glMultMatrixf(T_est_mat);
+            draw_frustum(1.0f, 1.0f, 0.0f, 0.0f); // Red
+            glPopMatrix();
+        }
+
+        // Draw ground-truth poses in green
+        for (size_t i = 0; i < Rs_gt.size(); ++i) {
+            float T_gt_mat[16] = {
+                float(Rs_gt[i].at<double>(0,0)), float(Rs_gt[i].at<double>(1,0)), float(Rs_gt[i].at<double>(2,0)), 0,
+                float(Rs_gt[i].at<double>(0,1)), float(Rs_gt[i].at<double>(1,1)), float(Rs_gt[i].at<double>(2,1)), 0,
+                float(Rs_gt[i].at<double>(0,2)), float(Rs_gt[i].at<double>(1,2)), float(Rs_gt[i].at<double>(2,2)), 0,
+                float(Ts_gt[i].at<double>(0)), float(Ts_gt[i].at<double>(1)), float(Ts_gt[i].at<double>(2)), 1
+            };
+            glPushMatrix();
+            glMultMatrixf(T_gt_mat);
+            draw_frustum(1.0f, 0.0f, 1.0f, 0.0f); // Green
+            glPopMatrix();
+        }
+
+        // Draw triangulated 3D points in green
+        glPointSize(2.0f);
+        glBegin(GL_POINTS);
+        glColor3f(0.0f, 1.0f, 0.0f); // Green
+        for (const auto& pt : points3D) {
+            glVertex3f(pt.x, pt.y, pt.z);
+        }
+        glEnd();
+
+        pangolin::FinishFrame();
+    }
+}
+
+void visualize_optical_flow(const cv::Mat& img_current,
+                            const std::vector<cv::Point2f>& points_prev,
+                            const std::vector<cv::Point2f>& points_current,
+                            const cv::Mat& mask, int frame_idx) {
+    cv::Mat img_color;
+    cv::cvtColor(img_current, img_color, cv::COLOR_GRAY2BGR);
+    for (size_t i = 0; i < points_current.size() && i < points_prev.size(); ++i) {
+        if (mask.at<uchar>(i)) {
+            cv::Point2f pt_current = points_current[i];
+            cv::Point2f pt_prev = points_prev[i];
+            cv::line(img_color, pt_current, pt_prev, cv::Scalar(0, 255, 0), 1);
+        }
+    }
+    std::string window_name = "Optical Flow";
+    cv::imshow(window_name, img_color);
+    cv::waitKey(10);
+}
+
+int main() {
+    std::string dir_path = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/";
+    TensorRTInference infer("../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt.onnx",
+                            "../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt");
+
+    // Update to process three images
+    const int num_images = 3;
+    cv::Mat K = load_calibration(dir_path + "calib.txt");
+    
+    auto poses = load_poses(dir_path + "00.txt", num_images);
+    std::vector<cv::Mat> Rs_gt(num_images), Ts_gt(num_images);
+    for (int i = 0; i < num_images; ++i) {
+        Rs_gt[i] = poses[i](cv::Rect(0, 0, 3, 3));
+        Ts_gt[i] = poses[i](cv::Rect(3, 0, 1, 3));
+    }
+
+    std::vector<cv::Mat> Rs_est(num_images), Ts_est(num_images);
+    Rs_est[0] = cv::Mat::eye(3, 3, CV_64F);
+    Ts_est[0] = cv::Mat::zeros(3, 1, CV_64F);
+
+    float scale_x = float(IMAGE_WIDTH) / MODEL_IMAGE_SIZE;
+    float scale_y = float(IMAGE_HEIGHT) / MODEL_IMAGE_SIZE;
+
+    std::vector<cv::Point3f> all_points3D;
+
+    // Variables to store 3D points and corresponding 2D points in image 1
+    std::vector<cv::Point3f> prev_points3D;
+    std::vector<cv::Point2f> prev_points2_inlier;
+
+    for (int i = 0; i < num_images - 1; ++i) {
+        std::ostringstream oss1, oss2;
+        oss1 << dir_path << "image_0/" << std::setw(6) << std::setfill('0') << i << ".png";
+        oss2 << dir_path << "image_0/" << std::setw(6) << std::setfill('0') << i + 1 << ".png";
+
+        cv::Mat img_current = cv::imread(oss2.str(), cv::IMREAD_GRAYSCALE);
+        if (img_current.empty()) {
+            std::cerr << "Failed to load current image: " << oss2.str() << "\n";
+            return -1;
+        }
+
+        std::vector<int64_t> keypoints, matches;
+        std::vector<float> scores;
+        infer.runInference(oss1.str(), oss2.str(), keypoints, matches, scores);
+
+        std::vector<cv::Point2f> points1, points2;
+        for (size_t m = 0; m < scores.size() && m * 3 + 2 < matches.size(); ++m) {
+            if (scores[m] >= SCORE_THRESHOLD && matches[m * 3] == 0) {
+                int left_idx = matches[m * 3 + 1];
+                int right_idx = matches[m * 3 + 2];
+                if (left_idx >= 0 && left_idx < MODEL_IMAGE_SIZE && right_idx >= 0 && right_idx < MODEL_IMAGE_SIZE) {
+                    points1.emplace_back(keypoints[left_idx * 2] * scale_x, keypoints[left_idx * 2 + 1] * scale_y);
+                    points2.emplace_back(keypoints[MODEL_IMAGE_SIZE * 2 + right_idx * 2] * scale_x,
+                                       keypoints[MODEL_IMAGE_SIZE * 2 + right_idx * 2 + 1] * scale_y);
+                }
+            }
+        }
+        std::cout << "Matches between images " << i << " and " << i + 1 << ": " << points1.size() << "\n";
+
+        cv::Mat R_rel, T_rel;
+        if (i == 0) {
+            // Two-view estimation for images 0 and 1
+            cv::Mat mask;
+            cv::Mat E = cv::findEssentialMat(points1, points2, K, cv::RANSAC, 0.999, 1.0, mask);
+            cv::recoverPose(E, points1, points2, K, R_rel, T_rel, mask);
+            R_rel = R_rel.t(); // Rotation from world to camera 1
+            T_rel = -R_rel * T_rel;
+
+            Rs_est[i + 1] = Rs_est[i] * R_rel;
+            Ts_est[i + 1] = Ts_est[i] + Rs_est[i] * T_rel;
+
+            // Extract inlier points2 for storage
+            std::vector<cv::Point2f> points2_inlier;
+            for (size_t j = 0; j < points2.size(); ++j) {
+                if (mask.at<uchar>(j)) {
+                    points2_inlier.push_back(points2[j]);
+                }
+            }
+
+            // Triangulate and store points
+            std::vector<cv::Point3f> points3D = triangulatePoints(K, Rs_est[i], Ts_est[i], Rs_est[i + 1], Ts_est[i + 1],
+                                                                  points1, points2, mask);
+            prev_points3D = points3D;
+            prev_points2_inlier = points2_inlier;
+            all_points3D.insert(all_points3D.end(), points3D.begin(), points3D.end());
+        } else {
+            // PnP for image 2 (i == 1, images 1 and 2)
+            std::vector<cv::Point3f> objectPoints;
+            std::vector<cv::Point2f> imagePoints;
+
+            // Associate keypoints in image 1 with stored inlier points
+            for (size_t j = 0; j < points1.size(); ++j) {
+                cv::Point2f pt1 = points1[j]; // Keypoint in image 1 from inference on images 1-2
+                double min_dist = 0.5; // Threshold in pixels
+                int closest_idx = -1;
+
+                // Find closest keypoint in prev_points2_inlier
+                for (size_t k = 0; k < prev_points2_inlier.size(); ++k) {
+                    double dist = cv::norm(pt1 - prev_points2_inlier[k]);
+                    if (dist < min_dist) {
+                        min_dist = dist;
+                        closest_idx = k;
+                    }
+                }
+
+                if (closest_idx != -1) {
+                    objectPoints.push_back(prev_points3D[closest_idx]); // 3D point
+                    imagePoints.push_back(points2[j]);                  // Corresponding 2D point in image 2
+                }
+            }
+
+            std::cout << "Found " << objectPoints.size() << " 3D-2D correspondences for PnP\n";
+
+            if (objectPoints.size() >= 4) { // Minimum points required for PnP
+                cv::Mat rvec, tvec;
+                cv::solvePnPRansac(objectPoints, imagePoints, K, cv::Mat(), rvec, tvec, false, 100, 1.0, 0.99,
+                                   cv::noArray(), cv::SOLVEPNP_ITERATIVE);
+                cv::Mat R;
+                cv::Rodrigues(rvec, R);
+                R = R.t();
+                tvec = -R * tvec;
+
+                Rs_est[i + 1] = R;       // Rotation from world to camera 2
+                Ts_est[i + 1] = tvec;    // Translation
+
+                // Triangulate points between images i and i+1 using estimated poses
+                cv::Mat mask = cv::Mat::ones(points1.size(), 1, CV_8U); // Use all points
+                std::vector<cv::Point3f> new_points3D = triangulatePoints(K, Rs_est[i], Ts_est[i], Rs_est[i + 1], Ts_est[i + 1],
+                                                                         points1, points2, mask);
+                all_points3D.insert(all_points3D.end(), new_points3D.begin(), new_points3D.end());
+            } else {
+                std::cerr << "Not enough correspondences for PnP\n";
+                return -1;
+            }
+        }
+
+        visualize_optical_flow(img_current, points1, points2, cv::Mat::ones(points1.size(), 1, CV_8U), i + 1);
+
+        std::cout << "Image " << i + 1 << ":\n";
+        std::cout << "Estimated T: " << Ts_est[i + 1].t() << "\n";
+        std::cout << "Ground Truth T: " << Ts_gt[i + 1].t() << "\n";
+        std::cout << "Rotation Error: " << compute_rotation_error(Rs_est[i + 1], Rs_gt[i + 1]) << " deg\n";
+        std::cout << "Translation Error: " << compute_translation_error(Ts_est[i + 1], Ts_gt[i + 1]) << " deg\n";
+    }
+
+    visualize_poses(Rs_est, Ts_est, Rs_gt, Ts_gt, all_points3D);
+    return 0;
+}

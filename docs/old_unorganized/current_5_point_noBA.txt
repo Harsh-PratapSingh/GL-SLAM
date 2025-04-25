@@ -1,0 +1,265 @@
+#include <opencv2/opencv.hpp>
+#include <opencv2/features2d.hpp>
+#include <fstream>
+#include <vector>
+#include <iostream>
+#include <pangolin/pangolin.h>
+#include "core/tensorrt_inference.h"
+
+constexpr float SCORE_THRESHOLD = 0.99f;
+constexpr int IMAGE_WIDTH = 1241;
+constexpr int IMAGE_HEIGHT = 376;
+constexpr int MODEL_IMAGE_SIZE = 1024;
+
+/** Loads an image in grayscale from the specified path. */
+cv::Mat load_image(const std::string& path) {
+    cv::Mat img = cv::imread(path, cv::IMREAD_GRAYSCALE);
+    if (img.empty()) {
+        std::cerr << "Failed to load image: " << path << std::endl;
+        exit(-1);
+    }
+    return img;
+}
+
+/** Loads the camera intrinsic matrix from calib.txt. */
+cv::Mat load_calibration(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open calibration file: " << path << std::endl;
+        exit(-1);
+    }
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.substr(0, 2) == "P0") {
+            std::istringstream iss(line.substr(4));
+            cv::Mat P0(3, 4, CV_64F);
+            for (int i = 0; i < 12; ++i) {
+                iss >> P0.at<double>(i / 4, i % 4);
+            }
+            return P0(cv::Rect(0, 0, 3, 3));
+        }
+    }
+    file.close();
+    std::cerr << "P0 not found in calibration file" << std::endl;
+    exit(-1);
+}
+
+/** Loads ground truth poses from a poses file (e.g., 00.txt). */
+std::vector<cv::Mat> load_poses(const std::string& path, int num_poses) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open poses file: " << path << std::endl;
+        exit(-1);
+    }
+    std::vector<cv::Mat> poses;
+    for (int i = 0; i < num_poses; ++i) {
+        std::string line;
+        if (!std::getline(file, line)) break;
+        std::istringstream iss(line);
+        cv::Mat pose(3, 4, CV_64F);
+        for (int j = 0; j < 12; ++j) {
+            iss >> pose.at<double>(j / 4, j % 4);
+        }
+        poses.push_back(pose);
+    }
+    file.close();
+    return poses;
+}
+
+/** Estimates relative pose using essential matrix and recovers rotation and translation. */
+void estimate_pose(const std::vector<cv::Point2f>& points1, const std::vector<cv::Point2f>& points2, const cv::Mat& K,
+                  cv::Mat& R, cv::Mat& T, int& inliers) {
+    cv::Mat mask;
+    cv::Mat E = cv::findEssentialMat(points1, points2, K, cv::RANSAC, 0.999, 1.0, mask);
+    if (E.empty()) {
+        std::cerr << "Essential matrix estimation failed" << std::endl;
+        exit(-1);
+    }
+    inliers = cv::recoverPose(E, points1, points2, K, R, T, mask);
+}
+
+/** Computes rotation error in degrees between estimated and ground truth rotation matrices. */
+double compute_rotation_error(const cv::Mat& R_est, const cv::Mat& R_gt) {
+    double trace = cv::trace(R_est.t() * R_gt)[0];
+    double cos_theta = (trace - 1.0) / 2.0;
+    return acos(std::clamp(cos_theta, -1.0, 1.0)) * 180.0 / CV_PI;
+}
+
+/** Computes translation direction error in degrees between estimated and ground truth vectors. */
+double compute_translation_error(const cv::Mat& T_est, const cv::Mat& T_gt) {
+    double dot_prod = T_est.dot(T_gt);
+    double norm_est = cv::norm(T_est);
+    double norm_gt = cv::norm(T_gt);
+    double cos_phi = dot_prod / (norm_est * norm_gt);
+    return acos(std::clamp(cos_phi, -1.0, 1.0)) * 180.0 / CV_PI;
+}
+
+/** Draws a camera frustum as a wireframe pyramid, inspired by reference code. */
+void DrawCameraFrustum(float scale, float r, float g, float b) {
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+    glColor3f(r, g, b);  // Set color for frustum
+    // Base square at z=0.8 * scale
+    float z = 0.8f * scale;
+    float s = 0.5f * scale;  // Half-size of base
+    glVertex3f(-s, -s, z); glVertex3f(s, -s, z);
+    glVertex3f(s, -s, z);  glVertex3f(s, s, z);
+    glVertex3f(s, s, z);   glVertex3f(-s, s, z);
+    glVertex3f(-s, s, z);  glVertex3f(-s, -s, z);
+    // Connect apex at (0, 0, 0) to base corners
+    glVertex3f(0, 0, 0); glVertex3f(-s, -s, z);
+    glVertex3f(0, 0, 0); glVertex3f(s, -s, z);
+    glVertex3f(0, 0, 0); glVertex3f(s, s, z);
+    glVertex3f(0, 0, 0); glVertex3f(-s, s, z);
+    glEnd();
+}
+
+/** Visualizes three camera frustums: first camera (blue), estimated second (red), ground truth second (green). */
+void visualize_poses(const cv::Mat& K, const cv::Mat& R_est, const cv::Mat& T_est, const cv::Mat& R_rel_gt, const cv::Mat& T_rel_gt) {
+    // Scale the estimated translation to match ground truth magnitude
+    double gt_magnitude = cv::norm(T_rel_gt);
+    cv::Mat T_est_scaled = -T_est * gt_magnitude;  // Negative direction had smaller error (1.0763° vs 178.924°)
+
+    // Debug: Output translation vectors
+    std::cout << "Ground Truth Translation: " << T_rel_gt.t() << std::endl;
+    std::cout << "Estimated Translation (scaled): " << T_est_scaled.t() << std::endl;
+    std::cout << "Ground Truth Translation Magnitude: " << gt_magnitude << std::endl;
+
+    // Convert matrices to float for OpenGL
+    cv::Mat R_est_float, T_est_scaled_float, R_rel_gt_float, T_rel_gt_float;
+    R_est.convertTo(R_est_float, CV_32F);
+    T_est_scaled.convertTo(T_est_scaled_float, CV_32F);
+    R_rel_gt.convertTo(R_rel_gt_float, CV_32F);
+    T_rel_gt.convertTo(T_rel_gt_float, CV_32F);
+
+    // Initialize Pangolin window
+    pangolin::CreateWindowAndBind("Pose Visualization", 1024, 768);
+    glEnable(GL_DEPTH_TEST);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Black background
+
+    // Set viewpoint and projection to match reference code
+    pangolin::OpenGlRenderState s_cam(
+        pangolin::ProjectionMatrix(1024, 768, 500, 500, 512, 389, 0.1, 1000),
+        pangolin::ModelViewLookAt(0, -10, -20, 0, 0, 0, 0.0, -1.0, 0.0)
+    );
+
+    pangolin::View& d_cam = pangolin::CreateDisplay()
+        .SetBounds(0.0, 1.0, 0.0, 1.0, -1024.0f / 768.0f)
+        .SetHandler(new pangolin::Handler3D(s_cam));
+
+    while (!pangolin::ShouldQuit()) {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        d_cam.Activate(s_cam);
+
+        // // Draw coordinate axes at origin for reference
+        // glColor3f(1.0f, 1.0f, 1.0f);  // White axes
+        // pangolin::glDrawAxis(1.0f);   // Size 1.0 for visibility
+
+        // Draw first camera frustum (blue) at origin
+        // glPushMatrix();
+        // glLoadIdentity();
+        DrawCameraFrustum(1.0f, 0.0f, 0.0f, 1.0f);  // Blue
+        // glPopMatrix();
+
+        // Draw estimated second camera frustum (red)
+        glPushMatrix();
+        float T_est[16] = {
+            R_est_float.at<float>(0,0), R_est_float.at<float>(1,0), R_est_float.at<float>(2,0), 0,
+            R_est_float.at<float>(0,1), R_est_float.at<float>(1,1), R_est_float.at<float>(2,1), 0,
+            R_est_float.at<float>(0,2), R_est_float.at<float>(1,2), R_est_float.at<float>(2,2), 0,
+            T_est_scaled_float.at<float>(0), T_est_scaled_float.at<float>(1), T_est_scaled_float.at<float>(2), 1
+        };
+        glMultMatrixf(T_est);
+        DrawCameraFrustum(1.0f, 1.0f, 0.0f, 0.0f);  // Red
+        glPopMatrix();
+
+        // Draw ground truth second camera frustum (green)
+        glPushMatrix();
+        float T_gt[16] = {
+            R_rel_gt_float.at<float>(0,0), R_rel_gt_float.at<float>(1,0), R_rel_gt_float.at<float>(2,0), 0,
+            R_rel_gt_float.at<float>(0,1), R_rel_gt_float.at<float>(1,1), R_rel_gt_float.at<float>(2,1), 0,
+            R_rel_gt_float.at<float>(0,2), R_rel_gt_float.at<float>(1,2), R_rel_gt_float.at<float>(2,2), 0,
+            T_rel_gt_float.at<float>(0), T_rel_gt_float.at<float>(1), T_rel_gt_float.at<float>(2), 1
+        };
+        glMultMatrixf(T_gt);
+        DrawCameraFrustum(1.0f, 0.0f, 1.0f, 0.0f);  // Green
+        glPopMatrix();
+
+        pangolin::FinishFrame();
+    }
+}
+
+int main() {
+    // Paths
+    const std::string dir_path = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/image_0/";
+    const std::string model_path = "../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt.onnx";
+    const std::string engine_path = "../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt";
+
+    // Initialize inference engine
+    TensorRTInference infer(model_path, engine_path);
+
+    // Run inference
+    std::vector<int64_t> keypoints;
+    std::vector<int64_t> matches;
+    std::vector<float> scores;
+    if (!infer.runInference(dir_path + "000000.png", dir_path + "000001.png", keypoints, matches, scores)) {
+        std::cerr << "Inference failed" << std::endl;
+        return -1;
+    }
+
+    // Scaling factors
+    const float scale_x = static_cast<float>(IMAGE_WIDTH) / MODEL_IMAGE_SIZE;
+    const float scale_y = static_cast<float>(IMAGE_HEIGHT) / MODEL_IMAGE_SIZE;
+
+    // Extract and scale matched keypoints
+    std::vector<cv::Point2f> points1, points2;
+    for (size_t m = 0; m < scores.size() && m * 3 + 2 < matches.size(); ++m) {
+        if (scores[m] >= SCORE_THRESHOLD && matches[m * 3] == 0) {
+            int left_idx = matches[m * 3 + 1];
+            int right_idx = matches[m * 3 + 2];
+            if (left_idx >= 0 && left_idx < MODEL_IMAGE_SIZE && right_idx >= 0 && right_idx < MODEL_IMAGE_SIZE) {
+                points1.emplace_back(keypoints[left_idx * 2] * scale_x, keypoints[left_idx * 2 + 1] * scale_y);
+                points2.emplace_back(keypoints[MODEL_IMAGE_SIZE * 2 + right_idx * 2] * scale_x,
+                                   keypoints[MODEL_IMAGE_SIZE * 2 + right_idx * 2 + 1] * scale_y);
+            }
+        }
+    }
+    std::cout << "Number of valid matches (score >= " << SCORE_THRESHOLD << "): " << points1.size() << std::endl;
+
+    // Load calibration and estimate pose
+    cv::Mat K = load_calibration(dir_path + "../calib.txt");
+    cv::Mat R_est, T_est;
+    int inliers;
+    estimate_pose(points1, points2, K, R_est, T_est, inliers);
+    std::cout << "Number of inliers: " << inliers << std::endl;
+
+    // Load ground truth poses and compute relative pose
+    auto poses = load_poses(dir_path + "../00.txt", 2);
+    cv::Mat R0 = poses[0](cv::Rect(0, 0, 3, 3));
+    cv::Mat T0 = poses[0](cv::Rect(3, 0, 1, 3));
+    cv::Mat R1 = poses[1](cv::Rect(0, 0, 3, 3));
+    cv::Mat T1 = poses[1](cv::Rect(3, 0, 1, 3));
+    cv::Mat R_rel_gt = R0.t() * R1;           // R0^T * R1
+    cv::Mat T_rel_gt = R0.t() * (T1 - T0);    // R0^T * (T1 - T0)
+
+    // Adjust estimated translation to world frame and select direction
+    cv::Mat T_est_world_neg = R1 * (-T_est);
+    cv::Mat T_est_world_pos = R1 * T_est;
+    double error_neg = compute_translation_error(T_est_world_neg, T_rel_gt);
+    double error_pos = compute_translation_error(T_est_world_pos, T_rel_gt);
+    cv::Mat T_est_world = (error_neg < error_pos) ? T_est_world_neg : T_est_world_pos;
+
+    // Compute errors
+    double rotation_error = compute_rotation_error(R_est, R_rel_gt);
+    double translation_error = std::min(error_neg, error_pos);
+
+    // Output results
+    std::cout << "\nPose Estimation Results:\n"
+              << "Rotation Error: " << rotation_error << " degrees\n"
+              << "Translation Direction Error: " << translation_error << " degrees\n";
+
+    // Visualize poses
+    visualize_poses(K, R_est, T_est, R_rel_gt, T_rel_gt);
+
+    return 0;
+}

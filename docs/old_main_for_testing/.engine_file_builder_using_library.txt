@@ -1,0 +1,20 @@
+#include "core/TensorRTEngineBuilder.h"
+#include <iostream>
+#include <filesystem>
+
+
+
+int main() {
+    const std::string enginePath = "/home/tomato/Desktop/Projects/GL-SLAM/third_party/Superpoint_Lightglue/lightglue_fp16_trt.engine";
+
+    if (!std::filesystem::exists(enginePath)) {
+        TensorRTEngineBuilder builder;
+        const bool success = builder.BuildEngine(
+            "/home/tomato/Desktop/Projects/GL-SLAM/third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt.onnx",
+            "/home/tomato/Desktop/Projects/GL-SLAM/third_party/Superpoint_Lightglue/lightglue_fp16_trt.engine"
+        );
+        std::cout << success ? "engine_build_successfully" : "error_in_building_engine";
+    }
+    return 0;
+}
+    

@@ -1,0 +1,652 @@
+
+#include <opencv2/opencv.hpp>
+#include <pangolin/pangolin.h>
+#include "core/tensorrt_inference.h"
+#include <iostream>
+#include <iomanip>
+
+#include <opencv2/core/eigen.hpp> // For cv2eigen and eigen2cv
+#include <g2o/core/robust_kernel_impl.h> // For RobustKernelHuber
+#include <g2o/core/sparse_optimizer.h>
+#include <g2o/core/block_solver.h>
+#include <g2o/core/optimization_algorithm_levenberg.h>
+#include <g2o/solvers/eigen/linear_solver_eigen.h>
+#include <g2o/types/sba/types_six_dof_expmap.h>
+#include <g2o/types/sba/types_sba.h>
+
+constexpr float SCORE_THRESHOLD = 0.70f;
+constexpr int IMAGE_WIDTH = 1241;
+constexpr int IMAGE_HEIGHT = 376;
+constexpr int MODEL_IMAGE_SIZE = 1024;
+
+std::vector<cv::Point3f> triangulatePoints(const cv::Mat& K, const cv::Mat& R1, const cv::Mat& T1, 
+                                          const cv::Mat& R2, const cv::Mat& T2, 
+                                          const std::vector<cv::Point2f>& points1, 
+                                          const std::vector<cv::Point2f>& points2, 
+                                          const cv::Mat& mask) {
+    // Constants for filtering
+    const float reproj_threshold = 5.0f; // Reprojection error threshold in pixels
+    const float min_depth = 0.1f;       // Minimum depth (meters)
+    const float max_depth = 100.0f;     // Maximum depth (meters)
+
+    // Validate inputs
+    if (points1.size() != points2.size() || points1.size() != mask.rows) {
+        std::cerr << "Error: Input sizes mismatch: points1=" << points1.size() 
+                  << ", points2=" << points2.size() << ", mask=" << mask.rows << std::endl;
+        return {};
+    }
+
+    // Invert extrinsic matrices: [R|T]^(-1) = [R.t()|-R.t()*T]
+    cv::Mat R1_inv = R1.t();
+    cv::Mat T1_inv = -R1_inv * T1;
+    cv::Mat R2_inv = R2.t();
+    cv::Mat T2_inv = -R2_inv * T2;
+
+    // Form projection matrices P = K * [R|T] using inverted extrinsics
+    cv::Mat P1_ext, P2_ext;
+    cv::hconcat(R1_inv, T1_inv, P1_ext);
+    cv::Mat P1 = K * P1_ext;
+    P1.convertTo(P1, CV_32F);
+    cv::hconcat(R2_inv, T2_inv, P2_ext);
+    cv::Mat P2 = K * P2_ext;
+    P2.convertTo(P2, CV_32F);
+
+    // Filter inlier points using the mask
+    std::vector<cv::Point2f> points1_inlier, points2_inlier;
+    for (size_t i = 0; i < points1.size(); ++i) {
+        if (mask.at<uchar>(i)) {
+            points1_inlier.push_back(points1[i]);
+            points2_inlier.push_back(points2[i]);
+        }
+    }
+
+    std::cout << "Points1_inlier size: " << points1_inlier.size() << std::endl;
+    std::cout << "Points2_inlier size: " << points2_inlier.size() << std::endl;
+
+    // Handle empty inlier case
+    if (points1_inlier.empty()) {
+        std::cout << "No inlier points to triangulate" << std::endl;
+        return {};
+    }
+
+    // Triangulate to get 3D points in homogeneous coordinates
+    cv::Mat points4D;
+    cv::triangulatePoints(P1, P2, points1_inlier, points2_inlier, points4D);
+
+    // Convert homogeneous coordinates to 3D Cartesian coordinates
+    std::vector<cv::Point3f> points3D;
+    for (int i = 0; i < points4D.cols; ++i) {
+        cv::Mat x = points4D.col(i);
+        x /= x.at<float>(3); // Normalize by the homogeneous coordinate
+        points3D.emplace_back(x.at<float>(0), x.at<float>(1), x.at<float>(2));
+    }
+    std::cout << "Triangulated points size: " << points3D.size() << std::endl;
+
+    // Verify triangulation output
+    if (points3D.size() != points1_inlier.size()) {
+        std::cerr << "Error: Triangulated points (" << points3D.size() 
+                  << ") do not match inlier count (" << points1_inlier.size() << ")" << std::endl;
+        return {};
+    }
+
+    // Helper function to project a 3D point to 2D
+    auto project = [&](const cv::Mat& R, const cv::Mat& T, const cv::Point3f& X) -> cv::Point2f {
+        cv::Mat X_world = (cv::Mat_<double>(3, 1) << X.x, X.y, X.z);
+        // Transform to camera frame: X_cam = R_inv * (X_world - T)
+        cv::Mat X_cam = R1_inv * (X_world - T1); // Use R_inv and T_inv for camera-to-world
+        cv::Mat proj = K * X_cam;
+        float u = proj.at<double>(0) / proj.at<double>(2);
+        float v = proj.at<double>(1) / proj.at<double>(2);
+        return cv::Point2f(u, v);
+    };
+
+    // Filter points based on reprojection error, cheirality, and depth
+    std::vector<cv::Point3f> filtered_points3D;
+    filtered_points3D.reserve(points3D.size()); // Preallocate for efficiency
+    for (size_t i = 0; i < points3D.size(); ++i) {
+        const cv::Point3f& X = points3D[i];
+
+        // Cheirality and depth check
+        cv::Mat X_world = (cv::Mat_<double>(3, 1) << X.x, X.y, X.z);
+        cv::Mat X_cam1 = R1_inv * (X_world - T1);
+        cv::Mat X_cam2 = R2_inv * (X_world - T2);
+        float z1 = X_cam1.at<double>(2);
+        float z2 = X_cam2.at<double>(2);
+
+        if (z1 <= min_depth || z2 <= min_depth || z1 >= max_depth || z2 >= max_depth) {
+            continue; // Skip points behind cameras or outside depth range
+        }
+
+        // Reprojection error check
+        cv::Point2f proj1 = project(R1, T1, X);
+        cv::Point2f proj2 = project(R2, T2, X);
+        float error1 = cv::norm(proj1 - points1_inlier[i]);
+        float error2 = cv::norm(proj2 - points2_inlier[i]);
+
+        if (error1 <= reproj_threshold && error2 <= reproj_threshold) {
+            filtered_points3D.push_back(X);
+        }
+    }
+
+    std::cout << "Filtered points size: " << filtered_points3D.size() << std::endl;
+
+    return filtered_points3D;
+}
+
+cv::Mat load_calibration(const std::string& path) {
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.substr(0, 2) == "P0") {
+            std::istringstream iss(line.substr(4));
+            cv::Mat P0(3, 4, CV_64F);
+            for (int i = 0; i < 12; ++i) iss >> P0.at<double>(i / 4, i % 4);
+            return P0(cv::Rect(0, 0, 3, 3));
+        }
+    }
+    std::cerr << "P0 not found\n";
+    exit(-1);
+}
+
+std::vector<cv::Mat> load_poses(const std::string& path, int num_poses) {
+    std::ifstream file(path);
+    std::vector<cv::Mat> poses;
+    std::string line;
+    for (int i = 0; i < num_poses && std::getline(file, line); ++i) {
+        std::istringstream iss(line);
+        cv::Mat pose(3, 4, CV_64F);
+        for (int j = 0; j < 12; ++j) iss >> pose.at<double>(j / 4, j % 4);
+        poses.push_back(pose);
+    }
+    if (poses.size() < num_poses) {
+        std::cerr << "Failed to load " << num_poses << " poses\n";
+        exit(-1);
+    }
+    return poses;
+}
+
+void estimate_pose(const std::vector<cv::Point2f>& points1, const std::vector<cv::Point2f>& points2, const cv::Mat& K,
+                  cv::Mat& R, cv::Mat& T) {
+    cv::Mat mask;
+    cv::Mat E = cv::findEssentialMat(points1, points2, K, cv::RANSAC, 0.999, 1.0, mask);
+    cv::recoverPose(E, points1, points2, K, R, T, mask);
+    R = R.t();
+    T = -R * T;
+}
+
+double compute_rotation_error(const cv::Mat& R_est, const cv::Mat& R_gt) {
+    double trace = cv::trace(R_est.t() * R_gt)[0];
+    return acos(std::clamp((trace - 1.0) / 2.0, -1.0, 1.0)) * 180.0 / CV_PI;
+}
+
+double compute_translation_error(const cv::Mat& T_est, const cv::Mat& T_gt) {
+    cv::Mat T_est_3 = T_est(cv::Rect(0, 0, 1, 3));
+    cv::Mat T_gt_3 = T_gt(cv::Rect(0, 0, 1, 3));
+    double cos_phi = T_est_3.dot(T_gt_3) / (cv::norm(T_est_3) * cv::norm(T_gt_3));
+    return acos(std::clamp(cos_phi, -1.0, 1.0)) * 180.0 / CV_PI;
+}
+
+void draw_frustum(float scale, float r, float g, float b) {
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+    glColor3f(r, g, b);
+    float z = 0.8f * scale, s = 0.5f * scale;
+    glVertex3f(-s, -s, z); glVertex3f(s, -s, z);
+    glVertex3f(s, -s, z);  glVertex3f(s, s, z);
+    glVertex3f(s, s, z);   glVertex3f(-s, s, z);
+    glVertex3f(-s, s, z);  glVertex3f(-s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(-s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(s, s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(-s, s, z);
+    glEnd();
+}
+
+// Visualize camera poses and triangulated 3D points
+void visualize_poses(const std::vector<cv::Mat>& Rs_est, const std::vector<cv::Mat>& Ts_est, 
+                     const std::vector<cv::Mat>& Rs_gt, const std::vector<cv::Mat>& Ts_gt,
+                     const std::vector<cv::Point3f>& points3D) {
+    pangolin::CreateWindowAndBind("Pose Visualization", 1024, 768);
+    glEnable(GL_DEPTH_TEST);
+    pangolin::OpenGlRenderState s_cam(
+        pangolin::ProjectionMatrix(1024, 768, 500, 500, 512, 389, 0.1, 1000),
+        pangolin::ModelViewLookAt(0, -10, -20, 0, 0, 0, 0.0, -1.0, 0.0)
+    );
+    pangolin::View& d_cam = pangolin::CreateDisplay()
+        .SetBounds(0.0, 1.0, 0.0, 1.0, -1024.0f / 768.0f)
+        .SetHandler(new pangolin::Handler3D(s_cam));
+
+    
+
+    while (!pangolin::ShouldQuit()) {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        d_cam.Activate(s_cam);
+
+        // Draw estimated poses in red
+        for (size_t i = 0; i < Rs_est.size(); ++i) {
+            float T_est_mat[16] = {
+                float(Rs_est[i].at<double>(0,0)), float(Rs_est[i].at<double>(1,0)), float(Rs_est[i].at<double>(2,0)), 0,
+                float(Rs_est[i].at<double>(0,1)), float(Rs_est[i].at<double>(1,1)), float(Rs_est[i].at<double>(2,1)), 0,
+                float(Rs_est[i].at<double>(0,2)), float(Rs_est[i].at<double>(1,2)), float(Rs_est[i].at<double>(2,2)), 0,
+                float(Ts_est[i].at<double>(0)), float(Ts_est[i].at<double>(1)), float(Ts_est[i].at<double>(2)), 1
+            };
+            glPushMatrix();
+            glMultMatrixf(T_est_mat);
+            draw_frustum(1.0f, 1.0f, 0.0f, 0.0f); // Red
+            glPopMatrix();
+        }
+
+        // Draw ground-truth poses in green
+        for (size_t i = 0; i < Rs_gt.size(); ++i) {
+            float T_gt_mat[16] = {
+                float(Rs_gt[i].at<double>(0,0)), float(Rs_gt[i].at<double>(1,0)), float(Rs_gt[i].at<double>(2,0)), 0,
+                float(Rs_gt[i].at<double>(0,1)), float(Rs_gt[i].at<double>(1,1)), float(Rs_gt[i].at<double>(2,1)), 0,
+                float(Rs_gt[i].at<double>(0,2)), float(Rs_gt[i].at<double>(1,2)), float(Rs_gt[i].at<double>(2,2)), 0,
+                float(Ts_gt[i].at<double>(0)), float(Ts_gt[i].at<double>(1)), float(Ts_gt[i].at<double>(2)), 1
+            };
+            glPushMatrix();
+            glMultMatrixf(T_gt_mat);
+            draw_frustum(1.0f, 0.0f, 1.0f, 0.0f); // Green
+            glPopMatrix();
+        }
+
+        // Draw triangulated 3D points in green
+        glPointSize(2.0f);
+        glBegin(GL_POINTS);
+        glColor3f(0.0f, 1.0f, 0.0f); // Green
+        for (const auto& pt : points3D) {
+            // if (pt.y < -0.5 && pt.y > -2.5){
+                glVertex3f(pt.x, pt.y, pt.z);
+            // }
+            // if (pt.z > 5.0 && pt.z < 15.00){
+            //     std::cout << "P =  " << pt.x << ", " << pt.y << ", " << pt.z << ":\n";
+            // }
+
+        }
+        glEnd();
+
+        pangolin::FinishFrame();
+    }
+}
+
+void visualize_optical_flow(const cv::Mat& img_current,
+                            const std::vector<cv::Point2f>& points_prev,
+                            const std::vector<cv::Point2f>& points_current,
+                            const cv::Mat& mask, int frame_idx) {
+    cv::Mat img_color;
+    cv::cvtColor(img_current, img_color, cv::COLOR_GRAY2BGR);
+    for (size_t i = 0; i < points_current.size() && i < points_prev.size(); ++i) {
+        if (mask.at<uchar>(i)) {
+            cv::Point2f pt_current = points_current[i];
+            cv::Point2f pt_prev = points_prev[i];
+            cv::line(img_color, pt_current, pt_prev, cv::Scalar(0, 255, 0), 1);
+        }
+    }
+    std::string window_name = "Optical Flow";
+    cv::imshow(window_name, img_color);
+    cv::waitKey(1);
+}
+
+int main() {
+    std::string dir_path = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/";
+    TensorRTInference infer("../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt.onnx",
+                            "../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt");
+
+    const int num_images =  2;
+    cv::Mat K = load_calibration(dir_path + "calib.txt");
+    
+    auto poses = load_poses(dir_path + "00.txt", num_images);
+    std::vector<cv::Mat> Rs_gt(num_images), Ts_gt(num_images);
+    for (int i = 0; i < num_images; ++i) {
+        Rs_gt[i] = poses[i](cv::Rect(0, 0, 3, 3));
+        Ts_gt[i] = poses[i](cv::Rect(3, 0, 1, 3));
+    }
+
+    std::vector<cv::Mat> Rs_est(num_images), Ts_est(num_images);
+    Rs_est[0] = cv::Mat::eye(3, 3, CV_64F);
+    Ts_est[0] = cv::Mat::zeros(3, 1, CV_64F);
+
+    float scale_x = float(IMAGE_WIDTH) / MODEL_IMAGE_SIZE;
+    float scale_y = float(IMAGE_HEIGHT) / MODEL_IMAGE_SIZE;
+
+    // Container for all triangulated 3D points
+    std::vector<cv::Point3f> all_points3D;
+
+    // NEW: Containers for 2D observations and their correspondences
+    std::vector<std::vector<cv::Point2f>> all_points2D(num_images);
+    std::vector<std::vector<int>> point_indices(num_images);
+
+    for (int i = 0; i < num_images - 1; ++i) {
+        std::ostringstream oss1, oss2;
+        oss1 << dir_path << "image_0/" << std::setw(6) << std::setfill('0') << i << ".png";
+        oss2 << dir_path << "image_0/" << std::setw(6) << std::setfill('0') << i + 1 << ".png";
+
+        cv::Mat img_current = cv::imread(oss2.str(), cv::IMREAD_GRAYSCALE);
+        if (img_current.empty()) {
+            std::cerr << "Failed to load current image: " << oss2.str() << "\n";
+            return -1;
+        }
+
+        std::vector<int64_t> keypoints, matches;
+        std::vector<float> scores;
+        infer.runInference(oss1.str(), oss2.str(), keypoints, matches, scores);
+
+        std::vector<cv::Point2f> points1, points2;
+        for (size_t m = 0; m < scores.size() && m * 3 + 2 < matches.size(); ++m) {
+            if (scores[m] >= SCORE_THRESHOLD && matches[m * 3] == 0) {
+                int left_idx = matches[m * 3 + 1];
+                int right_idx = matches[m * 3 + 2];
+                if (left_idx >= 0 && left_idx < MODEL_IMAGE_SIZE && right_idx >= 0 && right_idx < MODEL_IMAGE_SIZE) {
+                    points1.emplace_back(keypoints[left_idx * 2] * scale_x, keypoints[left_idx * 2 + 1] * scale_y);
+                    points2.emplace_back(keypoints[MODEL_IMAGE_SIZE * 2 + right_idx * 2] * scale_x,
+                                       keypoints[MODEL_IMAGE_SIZE * 2 + right_idx * 2 + 1] * scale_y);
+                }
+            }
+        }
+        std::cout << "Matches between images " << i << " and " << i + 1 << ": " << points1.size() << "\n";
+
+        cv::Mat R_rel, T_rel, mask;
+        cv::Mat E = cv::findEssentialMat(points1, points2, K, cv::FM_RANSAC, 0.9999, 0.2, mask);
+        cv::recoverPose(E, points1, points2, K, R_rel, T_rel, mask);
+        R_rel = R_rel.t();
+        T_rel = -R_rel*T_rel;
+
+        Rs_est[i + 1] = Rs_est[i] * R_rel;
+        Ts_est[i + 1] = Ts_est[i] + Rs_est[i] * T_rel;
+
+        // Triangulate points for frames i and i+1
+        std::vector<cv::Point3f> points3D = triangulatePoints(K, Rs_est[i], Ts_est[i], Rs_est[i + 1], Ts_est[i + 1], 
+                                                            points1, points2, mask);
+
+        // Append 3D points to the global container
+        int start_idx = all_points3D.size();
+        all_points3D.insert(all_points3D.end(), points3D.begin(), points3D.end());
+
+        // Store 2D observations and indices only for inliers
+        int inlier_count = 0;
+        for (size_t j = 0; j < points1.size(); ++j) {
+            if (mask.at<uchar>(j)) {  // Check if this match is an inlier
+                // Store 2D points for frame i
+                all_points2D[i].push_back(points1[j]);
+                point_indices[i].push_back(start_idx + inlier_count);
+
+                // Store 2D points for frame i+1
+                all_points2D[i + 1].push_back(points2[j]);
+                point_indices[i + 1].push_back(start_idx + inlier_count);
+
+                inlier_count++;
+            }
+        }
+
+        // Verify consistency
+        if (inlier_count != points3D.size()) {
+            std::cerr << "Error: inlier_count (" << inlier_count << ") does not match points3D.size() (" 
+                    << points3D.size() << ") for frame " << i << std::endl;
+            exit(-1);
+        }
+        inlier_count = points3D.size();   // Number of new 3D points
+        if (start_idx + inlier_count > all_points3D.size()) {
+            std::cerr << "Index out of bounds at frame " << i << std::endl;
+            exit(-1);
+        }
+
+
+        visualize_optical_flow(img_current, points1, points2, mask, i + 1);
+
+        std::cout << "Image " << i + 1 << ":\n";
+        std::cout << "Estimated T: " << Ts_est[i + 1].t() << "\n";
+        std::cout << "Ground Truth T: " << Ts_gt[i + 1].t() << "\n";
+        std::cout << "Rotation Error: " << compute_rotation_error(Rs_est[i + 1], Rs_gt[i + 1]) << " deg\n";
+        std::cout << "Translation Error: " << compute_translation_error(Ts_est[i + 1], Ts_gt[i + 1]) << " deg\n";
+    }
+
+    // // NEW: Set up and run bundle adjustment with g2o
+    // using BlockSolverType = g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>>;
+    // using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>;
+    // auto linearSolver = std::make_unique<LinearSolverType>();
+    // auto blockSolver = std::make_unique<BlockSolverType>(std::move(linearSolver));
+    // auto algorithm = new g2o::OptimizationAlgorithmLevenberg(std::move(blockSolver));
+    // g2o::SparseOptimizer optimizer;
+    // optimizer.setAlgorithm(algorithm);
+    // optimizer.setVerbose(true);
+
+    // std::vector<g2o::VertexSE3Expmap*> pose_vertices;
+    // for (int i = 0; i < num_images; ++i) {
+    //     Eigen::Matrix3d R_eigen;
+    //     cv::cv2eigen(Rs_est[i], R_eigen);
+    //     Eigen::Vector3d T_eigen;
+    //     cv::cv2eigen(Ts_est[i], T_eigen);
+    //     g2o::SE3Quat pose(R_eigen, T_eigen);
+    //     auto* v = new g2o::VertexSE3Expmap();
+    //     v->setId(i);
+    //     v->setEstimate(pose);
+    //     if (i == 0) v->setFixed(true);
+    //     optimizer.addVertex(v);
+    //     pose_vertices.push_back(v);
+    // }
+
+    // std::vector<g2o::VertexPointXYZ*> point_vertices;
+    // for (size_t i = 0; i < all_points3D.size(); ++i) {
+    //     Eigen::Vector3d point(all_points3D[i].x, all_points3D[i].y, all_points3D[i].z);
+    //     auto* v = new g2o::VertexPointXYZ();
+    //     v->setId(num_images + i);
+    //     v->setEstimate(point);
+    //     optimizer.addVertex(v);
+    //     point_vertices.push_back(v);
+    // }
+
+    // g2o::CameraParameters* cam_params = new g2o::CameraParameters(K.at<double>(0,0), Eigen::Vector2d(K.at<double>(0,2), K.at<double>(1,2)), 0);
+    // cam_params->setId(0);
+    // optimizer.addParameter(cam_params);
+
+
+    // for (int i = 0; i < num_images; ++i) {
+    //     for (size_t j = 0; j < all_points2D[i].size(); ++j) {
+    //         auto* e = new g2o::EdgeProjectXYZ2UV();
+    //         e->setVertex(0, point_vertices[point_indices[i][j]]);
+    //         e->setVertex(1, pose_vertices[i]);
+    //         Eigen::Vector2d obs(all_points2D[i][j].x, all_points2D[i][j].y);
+    //         e->setMeasurement(obs);
+    //         e->setInformation(Eigen::Matrix2d::Identity());
+    //         e->setParameterId(0, 0);
+    //         e->setRobustKernel(new g2o::RobustKernelHuber);
+    //         if (!optimizer.addEdge(e)) {
+    //             std::cerr << "Failed to add edge at " << i << ", " << j << std::endl;
+    //             delete e; // Clean up if addition fails
+    //         }
+    //     }
+    // }
+
+    // optimizer.initializeOptimization();
+    // optimizer.optimize(50);
+
+    // for (int i = 0; i < num_images; ++i) {
+    //     g2o::SE3Quat optimized_pose = pose_vertices[i]->estimate();
+    //     Eigen::Matrix3d R_optimized = optimized_pose.rotation().toRotationMatrix();
+    //     Eigen::Vector3d T_optimized = optimized_pose.translation();
+    //     cv::eigen2cv(R_optimized, Rs_est[i]);
+    //     cv::eigen2cv(T_optimized, Ts_est[i]);
+    // }
+    // for (size_t i = 0; i < all_points3D.size(); ++i) {
+    //     Eigen::Vector3d optimized_point = point_vertices[i]->estimate();
+    //     all_points3D[i] = cv::Point3f(optimized_point.x(), optimized_point.y(), optimized_point.z());
+    // }
+
+    // NEW: Set up and run bundle adjustment with g2o
+    // NEW: Set up and run bundle adjustment with g2oint start_idx = all_points3D.size();  // Index where new points will be added
+    
+
+
+    // using BlockSolverType = g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>>;
+    // using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>;
+    // auto solver = new g2o::OptimizationAlgorithmLevenberg(
+    //     std::make_unique<BlockSolverType>(std::make_unique<LinearSolverType>()));
+    // g2o::SparseOptimizer optimizer;
+    // optimizer.setAlgorithm(solver);
+    // optimizer.setVerbose(true);
+
+    // // Filter 3D points that are behind any camera
+    // std::vector<cv::Point3f> filtered_points3D;
+    // std::vector<bool> keep_point(all_points3D.size(), true);
+    // for (size_t i = 0; i < all_points3D.size(); ++i) {
+    //     cv::Point3f pt = all_points3D[i];
+    //     bool keep = true;
+    //     for (int j = 0; j < num_images; ++j) {
+    //         cv::Mat R = Rs_est[j];
+    //         cv::Mat T = Ts_est[j];
+    //         cv::Mat R_inv = R.t();
+    //         cv::Mat T_inv = -R_inv * T; // Use camera-to-world for depth check
+    //         cv::Mat pt_world = (cv::Mat_<double>(3,1) << pt.x, pt.y, pt.z);
+    //         cv::Mat pt_cam = R_inv * pt_world + T_inv; // Camera-to-world transform
+    //         double z = pt_cam.at<double>(2);
+    //         if (z <= 0.01) {
+    //             keep = false;
+    //             break;
+    //         }
+    //     }
+    //     if (keep) {
+    //         filtered_points3D.push_back(pt);
+    //     } else {
+    //         keep_point[i] = false;
+    //     }
+    // }
+
+    // // Update all_points3D
+    // all_points3D = filtered_points3D;
+
+    // // Adjust point_indices to reflect filtered points
+    // std::vector<std::vector<int>> new_point_indices(num_images);
+    // std::vector<int> old_to_new(all_points3D.size(), -1);
+    // int new_idx = 0;
+    // for (size_t i = 0; i < keep_point.size(); ++i) {
+    //     if (keep_point[i]) {
+    //         old_to_new[i] = new_idx++;
+    //     }
+    // }
+    // for (int i = 0; i < num_images; ++i) {
+    //     for (size_t j = 0; j < point_indices[i].size(); ++j) {
+    //         int old_idx = point_indices[i][j];
+    //         if (old_idx >= 0 && keep_point[old_idx]) {
+    //             new_point_indices[i].push_back(old_to_new[old_idx]);
+    //         }
+    //     }
+    // }
+    // point_indices = new_point_indices;
+
+    // // Add pose vertices (camera-to-world)
+    // std::vector<g2o::VertexSE3Expmap*> pose_vertices;
+    // for (int i = 0; i < num_images; ++i) {
+    //     cv::Mat R = Rs_est[i];
+    //     cv::Mat T = Ts_est[i];
+    //     cv::Mat R_inv = R.t();
+    //     cv::Mat T_inv = -R_inv * T;
+    //     Eigen::Matrix3d R_eigen;
+    //     cv2eigen(R_inv, R_eigen);
+    //     Eigen::Vector3d T_eigen;
+    //     cv2eigen(T_inv, T_eigen);
+    //     g2o::SE3Quat pose(R_eigen, T_eigen);
+    //     auto* v = new g2o::VertexSE3Expmap();
+    //     v->setId(i);
+    //     v->setEstimate(pose);
+    //     if (i == 0) v->setFixed(true);
+    //     optimizer.addVertex(v);
+    //     pose_vertices.push_back(v);
+    // }
+
+    // // Add point vertices
+    // std::vector<g2o::VertexPointXYZ*> point_vertices;
+    // for (size_t i = 0; i < all_points3D.size(); ++i) {
+    //     Eigen::Vector3d point(all_points3D[i].x, all_points3D[i].y, all_points3D[i].z);
+    //     auto* v = new g2o::VertexPointXYZ();
+    //     v->setId(num_images + i);
+    //     v->setEstimate(point);
+    //     v->setMarginalized(true);
+    //     optimizer.addVertex(v);
+    //     point_vertices.push_back(v);
+    // }
+
+    // // Set up camera parameters
+    // g2o::CameraParameters* cam_params = new g2o::CameraParameters(K.at<double>(0,0), Eigen::Vector2d(K.at<double>(0,2), K.at<double>(1,2)), 0);
+    // cam_params->setId(0);
+    // optimizer.addParameter(cam_params);
+
+    // // Add edges with depth-based weighting
+    // for (int i = 0; i < num_images; ++i) {
+    //     for (size_t j = 0; j < all_points2D[i].size(); ++j) {
+    //         int point_idx = point_indices[i][j];
+    //         if (point_idx >= 0) {
+    //             auto* e = new g2o::EdgeProjectXYZ2UV();
+    //             e->setVertex(0, point_vertices[point_idx]);
+    //             e->setVertex(1, pose_vertices[i]);
+    //             Eigen::Vector2d obs(all_points2D[i][j].x, all_points2D[i][j].y);
+    //             e->setMeasurement(obs);
+
+    //             // Compute depth for weighting (camera-to-world transform)
+    //             cv::Mat R = Rs_est[i];
+    //             cv::Mat T = Ts_est[i];
+    //             cv::Mat R_inv = R.t();
+    //             cv::Mat T_inv = -R_inv * T;
+    //             cv::Mat pt_world = (cv::Mat_<double>(3,1) << all_points3D[point_idx].x, all_points3D[point_idx].y, all_points3D[point_idx].z);
+    //             cv::Mat pt_cam = R_inv * pt_world + T_inv;
+    //             double z = pt_cam.at<double>(2);
+    //             double weight = (z > 0.1) ? 1.0 / (z * z) : 1.0 / (0.1 * 0.1);
+    //             Eigen::Matrix2d info = Eigen::Matrix2d::Identity() * weight;
+    //             e->setInformation(info);
+
+    //             e->setParameterId(0, 0);
+    //             e->setRobustKernel(new g2o::RobustKernelHuber);
+    //             e->robustKernel()->setDelta(3.0);
+    //             if (!optimizer.addEdge(e)) {
+    //                 std::cerr << "Failed to add edge at " << i << ", " << j << std::endl;
+    //                 delete e;
+    //             }
+    //         }
+    //     }
+    // }
+
+    // double initial_error = 0.0;
+    // for (auto* e : optimizer.edges()) {
+    //     auto* edge = dynamic_cast<g2o::EdgeProjectXYZ2UV*>(e);
+    //     edge->computeError();
+    //     initial_error += edge->chi2();
+    // }
+    // std::cout << "Initial reprojection error: " << initial_error << "\n";
+
+    // // Run optimization
+    // optimizer.initializeOptimization();
+    // optimizer.optimize(50);
+
+    // double final_error = 0.0;
+    // for (auto* e : optimizer.edges()) {
+    //     auto* edge = dynamic_cast<g2o::EdgeProjectXYZ2UV*>(e);
+    //     edge->computeError();
+    //     final_error += edge->chi2();
+    // }
+    // std::cout << "Final reprojection error: " << final_error << "\n";
+
+    // // Update poses and points (convert back to world-to-camera for visualization)
+    // for (int i = 0; i < num_images; ++i) {
+    //     g2o::SE3Quat optimized_pose = pose_vertices[i]->estimate();
+    //     Eigen::Matrix3d R_eigen = optimized_pose.rotation().toRotationMatrix();
+    //     Eigen::Vector3d T_eigen = optimized_pose.translation();
+    //     Eigen::Matrix3d R_inv = R_eigen.transpose();
+    //     Eigen::Vector3d T_inv = -R_inv * T_eigen;
+    //     eigen2cv(R_inv, Rs_est[i]);
+    //     eigen2cv(T_inv, Ts_est[i]);
+    // }
+    // for (size_t i = 0; i < all_points3D.size(); ++i) {
+    //     Eigen::Vector3d optimized_point = point_vertices[i]->estimate();
+    //     all_points3D[i] = cv::Point3f(optimized_point.x(), optimized_point.y(), optimized_point.z());
+    // }
+
+    // for (int i = 0; i < num_images - 1; ++i) {
+    //     std::cout << "Image " << i + 1 << ":\n";
+    //     std::cout << "Estimated T: " << Ts_est[i + 1].t() << "\n";
+    //     std::cout << "Ground Truth T: " << Ts_gt[i + 1].t() << "\n";
+    //     std::cout << "Rotation Error: " << compute_rotation_error(Rs_est[i + 1], Rs_gt[i + 1]) << " deg\n";
+    //     std::cout << "Translation Error: " << compute_translation_error(Ts_est[i + 1], Ts_gt[i + 1]) << " deg\n";
+    // }
+    // Visualize all poses and all triangulated points
+    visualize_poses(Rs_est, Ts_est, Rs_gt, Ts_gt, all_points3D);
+    return 0;
+}

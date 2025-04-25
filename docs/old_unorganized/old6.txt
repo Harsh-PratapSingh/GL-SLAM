@@ -1,0 +1,459 @@
+#include <opencv2/opencv.hpp>
+#include <pangolin/pangolin.h>
+#include "core/tensorrt_inference.h"
+#include <iostream>
+#include <iomanip>
+#include <vector>
+#include <map>
+
+// NEW: Define a structure to hold observation data for bundle adjustment
+struct Observation {
+    int camera_idx;       // Index of the camera/image
+    cv::Point2f point2D;  // Observed 2D point in the image
+};
+
+// NEW: Define a structure to hold 3D points and their observations
+struct Point3D {
+    cv::Point3f position;            // 3D position in world coordinates
+    std::vector<Observation> observations; // List of observations in different images
+};
+
+constexpr float SCORE_THRESHOLD = 0.99f;
+constexpr int IMAGE_WIDTH = 1241;
+constexpr int IMAGE_HEIGHT = 376;
+constexpr int MODEL_IMAGE_SIZE = 1024;
+
+// Function definitions (unchanged unless noted)
+std::vector<cv::Point3f> triangulatePoints(const cv::Mat& K, const cv::Mat& R1, const cv::Mat& T1, 
+                                          const cv::Mat& R2, const cv::Mat& T2, 
+                                          std::vector<cv::Point2f>& points1, 
+                                          std::vector<cv::Point2f>& points2, 
+                                          const cv::Mat& mask,
+                                          const std::vector<int>& exclude_indices) {
+    cv::Mat R1_64f, T1_64f, R2_64f, T2_64f, K_64f;
+    R1.convertTo(R1_64f, CV_64F);
+    T1.convertTo(T1_64f, CV_64F);
+    R2.convertTo(R2_64f, CV_64F);
+    T2.convertTo(T2_64f, CV_64F);
+    K.convertTo(K_64f, CV_64F);
+
+    cv::Mat R1_inv = R1_64f.t();
+    cv::Mat T1_inv = -R1_inv * T1_64f;
+    cv::Mat R2_inv = R2_64f.t();
+    cv::Mat T2_inv = -R2_inv * T2_64f;
+
+    cv::Mat P1_ext, P2_ext;
+    cv::hconcat(R1_inv, T1_inv, P1_ext);
+    cv::Mat P1 = K_64f * P1_ext;
+    P1.convertTo(P1, CV_64F);
+    cv::hconcat(R2_inv, T2_inv, P2_ext);
+    cv::Mat P2 = K_64f * P2_ext;
+    P2.convertTo(P2, CV_64F);
+
+    std::vector<cv::Point2f> points1_inlier, points2_inlier, p1, p2;
+    std::vector<bool> exclude(points1.size(), false);
+    for (int idx : exclude_indices) {
+        if (idx >= 0 && idx < exclude.size()) exclude[idx] = true;
+    }
+    for (size_t i = 0; i < points1.size(); ++i) {
+        if (mask.at<uchar>(i)) {
+            p1.push_back(points1[i]);
+            p2.push_back(points2[i]);
+            if (!exclude[i]) {
+                points1_inlier.push_back(points1[i]);
+                points2_inlier.push_back(points2[i]);
+            }
+        }
+    }
+    points1 = points1_inlier;
+    points2 = points2_inlier;
+
+    cv::Mat points4D;
+    cv::triangulatePoints(P1, P2, points1_inlier, points2_inlier, points4D);
+    points4D.convertTo(points4D, CV_64F);
+
+    std::vector<cv::Point3f> points3D;
+    const double x_min = -50.0, x_max = 50.0;
+    const double y_min = -10.0, y_max = 0.5;
+    const double z_min = 0.0, z_max = 30.0;
+    for (int i = 0; i < points4D.cols; ++i) {
+        cv::Mat x = points4D.col(i);
+        x /= x.at<double>(3);
+        cv::Point3f world_point(x.at<double>(0), x.at<double>(1), x.at<double>(2));
+        cv::Mat P_w = (cv::Mat_<double>(3, 1) << world_point.x, world_point.y, world_point.z);
+        cv::Mat P_c;
+        cv::subtract(P_w, T2_64f, P_c, cv::noArray(), CV_64F);
+        P_c = R2_inv * P_c;
+
+        double x_coord = P_c.at<double>(0);
+        double y_coord = P_c.at<double>(1);
+        double z_coord = P_c.at<double>(2);
+
+        if (x_coord >= x_min && x_coord <= x_max &&
+            y_coord >= y_min && y_coord <= y_max &&
+            z_coord >= z_min && z_coord <= z_max) {
+            points3D.push_back(world_point);
+        }
+    }
+    return points3D;
+}
+
+cv::Mat load_calibration(const std::string& path) {
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.substr(0, 2) == "P0") {
+            std::istringstream iss(line.substr(4));
+            cv::Mat P0(3, 4, CV_64F);
+            for (int i = 0; i < 12; ++i) iss >> P0.at<double>(i / 4, i % 4);
+            return P0(cv::Rect(0, 0, 3, 3));
+        }
+    }
+    std::cerr << "P0 not found\n";
+    exit(-1);
+}
+
+std::vector<cv::Mat> load_poses(const std::string& path, int num_poses) {
+    std::ifstream file(path);
+    std::vector<cv::Mat> poses;
+    std::string line;
+    for (int i = 0; i < num_poses && std::getline(file, line); ++i) {
+        std::istringstream iss(line);
+        cv::Mat pose(3, 4, CV_64F);
+        for (int j = 0; j < 12; ++j) iss >> pose.at<double>(j / 4, j % 4);
+        poses.push_back(pose);
+    }
+    if (poses.size() < num_poses) {
+        std::cerr << "Failed to load " << num_poses << " poses\n";
+        exit(-1);
+    }
+    return poses;
+}
+
+void estimate_pose(const std::vector<cv::Point2f>& points1, const std::vector<cv::Point2f>& points2, const cv::Mat& K,
+                  cv::Mat& R, cv::Mat& T) {
+    cv::Mat mask;
+    cv::Mat E = cv::findEssentialMat(points1, points2, K, cv::RANSAC, 0.999, 1.0, mask);
+    cv::recoverPose(E, points1, points2, K, R, T, mask);
+    R = R.t();
+    T = -R * T;
+}
+
+double compute_rotation_error(const cv::Mat& R_est, const cv::Mat& R_gt) {
+    double trace = cv::trace(R_est.t() * R_gt)[0];
+    return acos(std::clamp((trace - 1.0) / 2.0, -1.0, 1.0)) * 180.0 / CV_PI;
+}
+
+double compute_translation_error(const cv::Mat& T_est, const cv::Mat& T_gt) {
+    cv::Mat T_est_3 = T_est(cv::Rect(0, 0, 1, 3));
+    cv::Mat T_gt_3 = T_gt(cv::Rect(0, 0, 1, 3));
+    double cos_phi = T_est_3.dot(T_gt_3) / (cv::norm(T_est_3) * cv::norm(T_gt_3));
+    return acos(std::clamp(cos_phi, -1.0, 1.0)) * 180.0 / CV_PI;
+}
+
+void draw_frustum(float scale, float r, float g, float b) {
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+    glColor3f(r, g, b);
+    float z = 0.8f * scale, s = 0.5f * scale;
+    glVertex3f(-s, -s, z); glVertex3f(s, -s, z);
+    glVertex3f(s, -s, z);  glVertex3f(s, s, z);
+    glVertex3f(s, s, z);   glVertex3f(-s, s, z);
+    glVertex3f(-s, s, z);  glVertex3f(-s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(-s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(s, -s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(s, s, z);
+    glVertex3f(0, 0, 0);   glVertex3f(-s, s, z);
+    glEnd();
+}
+
+// NEW: Updated visualize_poses to use global_points3D instead of all_points3D
+void visualize_poses(const std::vector<cv::Mat>& Rs_est, const std::vector<cv::Mat>& Ts_est, 
+                     const std::vector<cv::Mat>& Rs_gt, const std::vector<cv::Mat>& Ts_gt,
+                     const std::vector<Point3D>& points3D) {
+    pangolin::CreateWindowAndBind("Pose Visualization", 1024, 768);
+    glEnable(GL_DEPTH_TEST);
+    pangolin::OpenGlRenderState s_cam(
+        pangolin::ProjectionMatrix(1024, 768, 500, 500, 512, 389, 0.1, 1000),
+        pangolin::ModelViewLookAt(0, -10, -20, 0, 0, 0, 0.0, -1.0, 0.0)
+    );
+    pangolin::View& d_cam = pangolin::CreateDisplay()
+        .SetBounds(0.0, 1.0, 0.0, 1.0, -1024.0f / 768.0f)
+        .SetHandler(new pangolin::Handler3D(s_cam));
+
+    while (!pangolin::ShouldQuit()) {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        d_cam.Activate(s_cam);
+
+        for (size_t i = 0; i < Rs_est.size(); ++i) {
+            float T_est_mat[16] = {
+                float(Rs_est[i].at<double>(0,0)), float(Rs_est[i].at<double>(1,0)), float(Rs_est[i].at<double>(2,0)), 0,
+                float(Rs_est[i].at<double>(0,1)), float(Rs_est[i].at<double>(1,1)), float(Rs_est[i].at<double>(2,1)), 0,
+                float(Rs_est[i].at<double>(0,2)), float(Rs_est[i].at<double>(1,2)), float(Rs_est[i].at<double>(2,2)), 0,
+                float(Ts_est[i].at<double>(0)), float(Ts_est[i].at<double>(1)), float(Ts_est[i].at<double>(2)), 1
+            };
+            glPushMatrix();
+            glMultMatrixf(T_est_mat);
+            draw_frustum(1.0f, 1.0f, 0.0f, 0.0f); // Red
+            glPopMatrix();
+        }
+
+        for (size_t i = 0; i < Rs_gt.size(); ++i) {
+            float T_gt_mat[16] = {
+                float(Rs_gt[i].at<double>(0,0)), float(Rs_gt[i].at<double>(1,0)), float(Rs_gt[i].at<double>(2,0)), 0,
+                float(Rs_gt[i].at<double>(0,1)), float(Rs_gt[i].at<double>(1,1)), float(Rs_gt[i].at<double>(2,1)), 0,
+                float(Rs_gt[i].at<double>(0,2)), float(Rs_gt[i].at<double>(1,2)), float(Rs_gt[i].at<double>(2,2)), 0,
+                float(Ts_gt[i].at<double>(0)), float(Ts_gt[i].at<double>(1)), float(Ts_gt[i].at<double>(2)), 1
+            };
+            glPushMatrix();
+            glMultMatrixf(T_gt_mat);
+            draw_frustum(1.0f, 0.0f, 1.0f, 0.0f); // Green
+            glPopMatrix();
+        }
+
+        glPointSize(2.0f);
+        glBegin(GL_POINTS);
+        glColor3f(0.0f, 1.0f, 0.0f); // Green
+        for (const auto& pt : points3D) {
+            glVertex3f(pt.position.x, pt.position.y, pt.position.z);
+        }
+        glEnd();
+
+        pangolin::FinishFrame();
+    }
+}
+
+void visualize_optical_flow(const cv::Mat& img_current,
+                            const std::vector<cv::Point2f>& points_prev,
+                            const std::vector<cv::Point2f>& points_current,
+                            const cv::Mat& mask, int frame_idx) {
+    cv::Mat img_color;
+    cv::cvtColor(img_current, img_color, cv::COLOR_GRAY2BGR);
+    for (size_t i = 0; i < points_current.size() && i < points_prev.size(); ++i) {
+        if (mask.at<uchar>(i)) {
+            cv::Point2f pt_current = points_current[i];
+            cv::Point2f pt_prev = points_prev[i];
+            cv::line(img_color, pt_current, pt_prev, cv::Scalar(0, 255, 0), 1);
+        }
+    }
+    std::string window_name = "Optical Flow";
+    cv::imshow(window_name, img_color);
+    cv::waitKey(1);
+}
+
+int main() {
+    std::string dir_path = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/";
+    TensorRTInference infer("../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt.onnx",
+                            "../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt");
+
+    const int num_images = 200;
+    cv::Mat K = load_calibration(dir_path + "calib.txt");
+    
+    auto poses = load_poses(dir_path + "00.txt", num_images);
+    std::vector<cv::Mat> Rs_gt(num_images), Ts_gt(num_images);
+    for (int i = 0; i < num_images; ++i) {
+        Rs_gt[i] = poses[i](cv::Rect(0, 0, 3, 3));
+        Ts_gt[i] = poses[i](cv::Rect(3, 0, 1, 3));
+    }
+
+    std::vector<cv::Mat> Rs_est(num_images), Ts_est(num_images);
+    Rs_est[0] = cv::Mat::eye(3, 3, CV_64F);
+    Ts_est[0] = cv::Mat::zeros(3, 1, CV_64F);
+
+    float scale_x = float(IMAGE_WIDTH) / MODEL_IMAGE_SIZE;
+    float scale_y = float(IMAGE_HEIGHT) / MODEL_IMAGE_SIZE;
+
+    // NEW: Replace all_points3D with a global point cloud that tracks observations
+    std::vector<Point3D> global_points3D;
+
+
+    std::vector<cv::Point2f> prev_points2;
+
+    for (int i = 0; i < num_images - 1; ++i) {
+        std::ostringstream oss1, oss2;
+        oss1 << dir_path << "image_0/" << std::setw(6) << std::setfill('0') << i << ".png";
+        oss2 << dir_path << "image_0/" << std::setw(6) << std::setfill('0') << (i+1) << ".png";
+
+        cv::Mat img1 = cv::imread(oss1.str(), cv::IMREAD_GRAYSCALE);
+        cv::Mat img2 = cv::imread(oss2.str(), cv::IMREAD_GRAYSCALE);
+        if (img1.empty() || img2.empty()) {
+            std::cerr << "Failed to load images: " << oss1.str() << " or " << oss2.str() << "\n";
+            return -1;
+        }
+
+        int original_width = 1241;
+        int original_height = 376;
+        int padded_size = original_width;
+        int padding_top = (padded_size - original_height) / 2;
+        int padding_bottom = padded_size - original_height - padding_top;
+
+        cv::Mat padded_img1, padded_img2;
+        cv::copyMakeBorder(img1, padded_img1, padding_top, padding_bottom, 0, 0, cv::BORDER_CONSTANT, cv::Scalar(0));
+        cv::copyMakeBorder(img2, padded_img2, padding_top, padding_bottom, 0, 0, cv::BORDER_CONSTANT, cv::Scalar(0));
+
+        cv::Mat resized_img1, resized_img2;
+        cv::resize(padded_img1, resized_img1, cv::Size(MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE));
+        cv::resize(padded_img2, resized_img2, cv::Size(MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE));
+
+        std::string temp_path1 = "temp1.png";
+        std::string temp_path2 = "temp2.png";
+        cv::imwrite(temp_path1, resized_img1);
+        cv::imwrite(temp_path2, resized_img2);
+
+        std::vector<int64_t> keypoints, matches;
+        std::vector<float> scores;
+        infer.runInference(temp_path1, temp_path2, keypoints, matches, scores);
+
+        float S = static_cast<float>(padded_size) / MODEL_IMAGE_SIZE;
+
+        auto map_to_original = [&](float x_model, float y_model, float& x_orig, float& y_orig) -> bool {
+            float x_pad = x_model * S;
+            float y_pad = y_model * S;
+            if (y_pad >= padding_top && y_pad < padding_top + original_height) {
+                x_orig = x_pad;
+                y_orig = y_pad - padding_top;
+                return true;
+            }
+            return false;
+        };
+
+        std::vector<cv::Point2f> points1, points2;
+        for (size_t m = 0; m < scores.size() && m * 3 + 2 < matches.size(); ++m) {
+            if (scores[m] >= SCORE_THRESHOLD && matches[m * 3] == 0) {
+                int left_idx = matches[m * 3 + 1];
+                int right_idx = matches[m * 3 + 2];
+                if (left_idx >= 0 && left_idx < MODEL_IMAGE_SIZE && right_idx >= 0 && right_idx < MODEL_IMAGE_SIZE) {
+                    float x_model1 = keypoints[left_idx * 2];
+                    float y_model1 = keypoints[left_idx * 2 + 1];
+                    float x_model2 = keypoints[MODEL_IMAGE_SIZE * 2 + right_idx * 2];
+                    float y_model2 = keypoints[MODEL_IMAGE_SIZE * 2 + right_idx * 2 + 1];
+
+                    float x_orig1, y_orig1, x_orig2, y_orig2;
+                    bool valid1 = map_to_original(x_model1, y_model1, x_orig1, y_orig1);
+                    bool valid2 = map_to_original(x_model2, y_model2, x_orig2, y_orig2);
+
+                    if (valid1 && valid2) {
+                        points1.emplace_back(x_orig1, y_orig1);
+                        points2.emplace_back(x_orig2, y_orig2);
+                    }
+                }
+            }
+        }
+
+        std::cout << "Matches between images " << i << " and " << i + 1 << ": " << points1.size() << "\n";
+
+        std::vector<cv::Point2f> filtered_points1, filtered_points2;
+        std::vector<float> distances;
+        int c=0;
+        for (size_t j = 0; j < points1.size(); ++j) {
+            float dx = points2[j].x - points1[j].x;
+            float dy = points2[j].y - points1[j].y;
+            float distance = std::sqrt(dx * dx + dy * dy);
+            distances.push_back(distance);
+        }
+        if (!distances.empty()) {
+            float variable_threshold = 100.0f;
+            for (size_t j = 0; j < points1.size(); ++j) {
+                if (distances[j] <= variable_threshold) {
+                    filtered_points1.push_back(points1[j]);
+                    filtered_points2.push_back(points2[j]);
+                    c++;
+                }
+            }
+        } else {
+            filtered_points1 = points1;
+            filtered_points2 = points2;
+        }
+        std::cout << "filtered " << points1.size() - c << " keypoints \n";
+        points1 = filtered_points1;
+        points2 = filtered_points2;
+        
+
+        cv::Mat R_rel, T_rel, mask;
+        cv::Mat E = cv::findEssentialMat(points1, points2, K, cv::RANSAC, 0.9999, 0.5, mask);
+        cv::recoverPose(E, points1, points2, K, R_rel, T_rel, mask);
+        R_rel = R_rel.t();
+        T_rel = -R_rel * T_rel;
+
+        Rs_est[i + 1] = Rs_est[i] * R_rel;
+        Ts_est[i + 1] = Ts_est[i] + Rs_est[i] * T_rel;
+
+        std::vector<int> exclude_indices;
+        const float match_threshold = 1.0f;
+        if (i > 0 && !prev_points2.empty()) {
+            for (size_t j = 0; j < points1.size(); ++j) {
+                if (mask.at<uchar>(j)) {
+                    // exclude_indices.push_back(j);
+                    //Here add the code to update observations of 3dpoint of matches in prev_point2 and current point1 to point2
+                    for (size_t k = 0; k < global_points3D.size(); ++k) {
+                        for (const auto& obs : global_points3D[k].observations) {
+                            if (obs.camera_idx == i && cv::norm(points1[j] - obs.point2D) < match_threshold) {
+                                exclude_indices.push_back(j);
+                                global_points3D[k].observations.push_back({i + 1, points2[j]}); 
+                                break; 
+                            }
+                        }
+                    }
+                        
+                    
+                }
+            }
+            std::cout << "Updated observations for " << exclude_indices.size() << " keypoints that match previous frame.\n";
+        }
+        prev_points2 = points2;
+        // for (size_t k = 0; k < global_points3D.size(); ++k) {
+        //     for (const auto& obs : global_points3D[k].observations) {
+        //         if (obs.camera_idx == i ) {
+        //             for(size_t m = 0; m < points1.size(); ++m){
+        //                 if(cv::norm(obs.point2D - points1[m]) < match_threshold){
+        //                     exclude_indices.push_back(m);
+                            
+        //                 }
+        //             }
+        //             // Update the existing 3D point with the new observation from image i+1
+        //             //global_points3D[k].observations.push_back({i + 1, points2[j]});
+                    
+        //              // Assuming one observation per image per 3D point
+        //         }
+        //     }
+        // }
+        // std::cout << "Discarded " << exclude_indices.size() << " keypoints that match previous frame.\n";
+
+
+        visualize_optical_flow(img2, points1, points2, mask, i + 1);
+
+        // NEW: Triangulate inliners and not excluded points and integrate into global point cloud with observations
+        std::vector<cv::Point3f> points3D = triangulatePoints(K, Rs_est[i], Ts_est[i], Rs_est[i + 1], Ts_est[i + 1], 
+                                                              points1, points2, mask, exclude_indices);
+        
+
+
+        // std::cout << "Included " << o << " keypoints that match previous frame.\n";
+
+        // NEW: Add those points to global point cloud and record observations
+        for (size_t k = 0; k < points3D.size(); ++k) {
+            Point3D new_point;
+            new_point.position = points3D[k];
+            new_point.observations.push_back({i, points1[k]});     // Observation in image i
+            new_point.observations.push_back({i + 1, points2[k]}); // Observation in image i+1
+            global_points3D.push_back(new_point);
+        }
+
+        
+        std::cout << "New points: " << points3D.size() << " \n";
+        std::cout << "Image " << i + 1 << ":\n";
+        std::cout << "Estimated T: " << Ts_est[i + 1].t() << "\n";
+        std::cout << "Ground Truth T: " << Ts_gt[i + 1].t() << "\n";
+        std::cout << "Rotation Error: " << compute_rotation_error(Rs_est[i + 1], Rs_gt[i + 1]) << " deg\n";
+        std::cout << "Translation Error: " << compute_translation_error(Ts_est[i + 1], Ts_gt[i + 1]) << " deg\n";
+    }
+
+    // NEW: Data is now prepared for bundle adjustment
+    // - global_points3D contains 3D points with their 2D observations
+    // - Rs_est and Ts_est contain initial camera poses
+    // - K is the intrinsic camera matrix
+    // Next step: Pass this data to a bundle adjustment solver (e.g., Ceres Solver) to optimize poses and 3D points
+
+    visualize_poses(Rs_est, Ts_est, Rs_gt, Ts_gt, global_points3D);
+    return 0;
+}

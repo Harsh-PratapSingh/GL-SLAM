@@ -1,0 +1,129 @@
+#include "core/tensorrt_inference.h"
+#include <iostream>
+#include <opencv2/opencv.hpp>
+#include <opencv2/viz.hpp>
+
+
+int main() {
+
+  std::string dir_path = "../data/sample/test2/";
+  // Initialize the inference engine
+  TensorRTInference infer("../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt.onnx",
+                          "../third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt");
+
+  // Output containers
+  std::vector<int64_t> keypoints;
+  std::vector<int64_t> matches;
+  std::vector<float> scores;
+
+  // Run inference
+  if (!infer.runInference(dir_path +"image_8.jpg", dir_path +"image_9.jpg", keypoints, matches, scores)) {
+    std::cerr << "Inference failed" << std::endl;
+    return -1;
+  }
+
+  // Print some results for verification
+  std::cout << "Keypoints (first 10 per image):" << std::endl;
+  for (int b = 0; b < 2; ++b) {
+    std::cout << "Image " << b << ":" << std::endl;
+    for (int k = 0; k < 10; ++k) {
+      int idx = b * 1024 * 2 + k * 2;
+      std::cout << "(" << keypoints[idx] << ", " << keypoints[idx + 1] << ") ";
+    }
+    std::cout << std::endl;
+  }
+
+  std::cout << "Matches (first 10):" << std::endl;
+  for (int m = 0; m < 10; ++m) {
+    if (scores[m] <= 0 || matches[m * 3] < 0) break;
+    std::cout << "(" << matches[m * 3] << ", " << matches[m * 3 + 1] << ", "
+              << matches[m * 3 + 2] << ") Score: " << scores[m] << std::endl;
+  }
+
+
+  std::vector<cv::Point2f> leftPoints, rightPoints;
+  for (size_t m = 0; m < scores.size(); ++m) {
+    if (scores[m] <= 0 || matches[m * 3] < 0) break; // Stop at invalid matches
+    int batchIdx = matches[m * 3];
+    if (batchIdx != 0) continue; // Only process batch 0 (L0, R0)
+
+    int leftIdx = matches[m * 3 + 1];
+    int rightIdx = matches[m * 3 + 2];
+
+    float leftX = static_cast<float>(keypoints[leftIdx * 2]);
+    float leftY = static_cast<float>(keypoints[leftIdx * 2 + 1]);
+    float rightX = static_cast<float>(keypoints[1024 * 2 + rightIdx * 2]); // Offset for right image
+    float rightY = static_cast<float>(keypoints[1024 * 2 + rightIdx * 2 + 1]);
+
+    if (leftX >= 0 && leftY >= 0 && rightX >= 0 && rightY >= 0) {
+      leftPoints.emplace_back(leftX, leftY);
+      rightPoints.emplace_back(rightX, rightY);
+    }
+  }
+
+  if (leftPoints.size() < 8) {
+    std::cerr << "Not enough matches for pose estimation (" << leftPoints.size() << " found, need at least 8)" << std::endl;
+    return -1;
+  }
+
+  // Camera intrinsic parameters (replace with your actual K)
+  double fx = 500.0, fy = 500.0, cx = 320.0, cy = 240.0;  // Example for 640x480
+  cv::Mat K = (cv::Mat_<double>(3, 3) << fx, 0, cx,
+                                         0, fy, cy,
+                                         0,  0,  1);
+
+  // Compute Fundamental matrix with RANSAC
+  cv::Mat F, inlier_mask;
+  F = cv::findFundamentalMat(leftPoints, rightPoints, cv::FM_RANSAC, 1.0, 0.99, inlier_mask);
+  std::cout << "Fundamental matrix:\n" << F << std::endl;
+
+  // Filter inliers
+    std::vector<cv::Point2f> pts1_inliers, pts2_inliers;
+    for (size_t i = 0; i < inlier_mask.rows; i++) {
+        if (inlier_mask.at<uchar>(i)) {
+            pts1_inliers.push_back(leftPoints[i]);
+            pts2_inliers.push_back(rightPoints[i]);
+        }
+    }
+    std::cout << "Number of inliers: " << pts1_inliers.size() << std::endl;
+
+
+    // Compute Essential matrix
+    cv::Mat E = K.t() * F * K;
+    std::cout << "Essential matrix:\n" << E << std::endl;
+
+    // Decompose Essential matrix to get R and t
+    cv::Mat R, t, mask;
+    int inliers = cv::recoverPose(E, pts1_inliers, pts2_inliers, K, R, t, mask);
+    std::cout << "Rotation matrix (R):\n" << R << std::endl;
+    std::cout << "Translation vector (t):\n" << t << std::endl;
+    std::cout << "Inliers from recoverPose: " << inliers << std::endl;
+
+    // Validate rotation angle
+    cv::Mat z_axis = (cv::Mat_<double>(3, 1) << 0, 0, 1);
+    cv::Mat cam2_direction = R * z_axis;
+    double dot = z_axis.dot(cam2_direction);
+    double angle = std::acos(dot) * 180.0 / CV_PI;
+    std::cout << "Angle between camera directions: " << angle << " degrees" << std::endl;
+
+    // Visualization
+    cv::viz::Viz3d window("Pose Estimation");
+    window.setBackgroundColor(cv::viz::Color::black());
+
+    cv::Mat R1 = cv::Mat::eye(3, 3, CV_64F);
+    cv::Mat t1 = cv::Mat::zeros(3, 1, CV_64F);
+    cv::Affine3d pose1(R1, t1);
+    cv::Affine3d pose2(R, t);
+
+    window.showWidget("Camera1", cv::viz::WCameraPosition(cv::Matx33d(K), 1.0), pose1);
+    window.showWidget("Camera2", cv::viz::WCameraPosition(cv::Matx33d(K), 1.0), pose2);
+    window.showWidget("Axes", cv::viz::WCoordinateSystem(1.0));
+
+    std::cout << "Press 'q' to close" << std::endl;
+    window.spin();
+
+  
+
+
+  return 0;
+}

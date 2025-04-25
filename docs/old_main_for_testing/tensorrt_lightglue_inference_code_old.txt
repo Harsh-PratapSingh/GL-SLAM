@@ -1,0 +1,244 @@
+#include <NvInfer.h>
+#include <NvOnnxParser.h>
+#include <cuda_runtime_api.h>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <opencv2/opencv.hpp>
+
+using namespace nvinfer1;
+
+// Logger class for TensorRT
+class Logger : public ILogger {
+  void log(Severity severity, const char* msg) noexcept override {
+    if (severity != Severity::kINFO) {
+      std::cerr << msg << std::endl;
+    }
+  }
+};
+
+// Utility to check CUDA errors
+#define CHECK_CUDA(call)                                                       \
+  do {                                                                         \
+    cudaError_t status = call;                                                 \
+    if (status != cudaSuccess) {                                               \
+      std::cerr << "CUDA error: " << cudaGetErrorString(status) << " at "      \
+                << __FILE__ << ":" << __LINE__ << std::endl;                   \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
+  } while (0)
+
+// Function to load engine from file or build it from ONNX
+std::vector<char> loadOrBuildEngine(const std::string& onnxFile,
+                                    const std::string& engineFile,
+                                    Logger& logger) {
+  std::ifstream engineStream(engineFile, std::ios::binary);
+  if (engineStream.good()) {
+    engineStream.seekg(0, std::ios::end);
+    size_t size = engineStream.tellg();
+    engineStream.seekg(0, std::ios::beg);
+    std::vector<char> engineData(size);
+    engineStream.read(engineData.data(), size);
+    engineStream.close();
+    std::cout << "Loaded existing engine from " << engineFile << std::endl;
+    return engineData;
+  }
+
+  std::unique_ptr<IBuilder> builder(createInferBuilder(logger));
+  std::unique_ptr<INetworkDefinition> network(builder->createNetworkV2(0U));
+  std::unique_ptr<nvonnxparser::IParser> parser(
+      nvonnxparser::createParser(*network, logger));
+
+  std::ifstream onnxStream(onnxFile, std::ios::binary);
+  onnxStream.seekg(0, std::ios::end);
+  size_t onnxSize = onnxStream.tellg();
+  onnxStream.seekg(0, std::ios::beg);
+  std::vector<char> onnxData(onnxSize);
+  onnxStream.read(onnxData.data(), onnxSize);
+  onnxStream.close();
+
+  if (!parser->parse(onnxData.data(), onnxSize)) {
+    std::cerr << "ERROR: Failed to parse ONNX file" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  std::unique_ptr<IBuilderConfig> config(builder->createBuilderConfig());
+  config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, 1ULL << 30); // 1GB workspace
+
+  std::unique_ptr<ICudaEngine> engine(
+      builder->buildEngineWithConfig(*network, *config));
+  if (!engine) {
+    std::cerr << "ERROR: Failed to build engine" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  std::unique_ptr<IHostMemory> serializedEngine(engine->serialize());
+  std::ofstream engineOut(engineFile, std::ios::binary);
+  engineOut.write(static_cast<char*>(serializedEngine->data()),
+                  serializedEngine->size());
+  engineOut.close();
+  std::cout << "Built and saved engine to " << engineFile << std::endl;
+
+  return std::vector<char>(static_cast<char*>(serializedEngine->data()),
+                           static_cast<char*>(serializedEngine->data()) +
+                               serializedEngine->size());
+}
+
+// Load and preprocess image
+void loadAndPreprocessImage(const std::string& filePath, float* buffer, int offset,
+                            int height, int width, cv::Mat& outputImg) {
+  cv::Mat img = cv::imread(filePath, cv::IMREAD_COLOR); // Load in color for visualization
+  if (img.empty()) {
+    std::cerr << "ERROR: Failed to load image " << filePath << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  cv::Mat resized;
+  cv::resize(img, resized, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
+  outputImg = resized.clone(); // Save for visualization
+
+  // Convert to grayscale and normalize for inference
+  cv::Mat gray;
+  cv::cvtColor(resized, gray, cv::COLOR_BGR2GRAY);
+  for (int h = 0; h < height; ++h) {
+    for (int w = 0; w < width; ++w) {
+      buffer[offset + h * width + w] =
+          static_cast<float>(gray.at<uint8_t>(h, w)) / 255.0f;
+    }
+  }
+}
+
+int main() {
+  Logger logger;
+
+  // File paths
+  const std::string onnxFile = "superpoint_lightglue_pipeline.trt.onnx";
+  const std::string engineFile = "superpoint_lightglue_pipeline.trt";
+  const std::string leftImage = "left_0.jpg";
+  const std::string rightImage = "right_0.jpg";
+
+  // Load or build TensorRT engine
+  auto engineData = loadOrBuildEngine(onnxFile, engineFile, logger);
+  std::unique_ptr<IRuntime> runtime(createInferRuntime(logger));
+  std::unique_ptr<ICudaEngine> engine(
+      runtime->deserializeCudaEngine(engineData.data(), engineData.size()));
+  if (!engine) {
+    std::cerr << "ERROR: Failed to deserialize engine" << std::endl;
+    return -1;
+  }
+
+  std::unique_ptr<IExecutionContext> context(engine->createExecutionContext());
+  if (!context) {
+    std::cerr << "ERROR: Failed to create execution context" << std::endl;
+    return -1;
+  }
+
+  // Input and output dimensions
+  const int batchSize = 2; // Static batch size of 2 (L0, R0)
+  const int channels = 1;
+  const int height = 1024;
+  const int width = 1024;
+  const int inputSize = batchSize * channels * height * width;
+  const int keypointsSize = batchSize * 1024 * 2; // (2, 1024, 2)
+
+  // Allocate host and device memory for input
+  std::vector<float> inputHost(inputSize);
+  void* inputDevice = nullptr;
+  CHECK_CUDA(cudaMalloc(&inputDevice, inputSize * sizeof(float)));
+
+  // Load and preprocess images
+  cv::Mat leftImg, rightImg;
+  loadAndPreprocessImage(leftImage, inputHost.data(), 0, height, width, leftImg);
+  loadAndPreprocessImage(rightImage, inputHost.data(), height * width, height, width, rightImg);
+  CHECK_CUDA(
+      cudaMemcpy(inputDevice, inputHost.data(), inputSize * sizeof(float),
+                 cudaMemcpyHostToDevice));
+
+  // Allocate device memory for outputs
+  void* keypointsDevice = nullptr;
+  void* matchesDevice = nullptr;
+  void* scoresDevice = nullptr;
+
+  const int maxMatches = 4096; // Adjust based on expected max matches
+  CHECK_CUDA(cudaMalloc(&keypointsDevice, keypointsSize * sizeof(int64_t)));
+  CHECK_CUDA(cudaMalloc(&matchesDevice, maxMatches * 3 * sizeof(int64_t)));
+  CHECK_CUDA(cudaMalloc(&scoresDevice, maxMatches * sizeof(float)));
+
+  // Bindings for TensorRT
+  void* bindings[4] = {inputDevice, keypointsDevice, matchesDevice, scoresDevice};
+
+  // Run inference
+  if (!context->executeV2(bindings)) {
+    std::cerr << "ERROR: Failed to execute inference" << std::endl;
+    return -1;
+  }
+
+  // Copy outputs back to host
+  std::vector<int64_t> keypointsHost(keypointsSize);
+  std::vector<int64_t> matchesHost(maxMatches * 3);
+  std::vector<float> scoresHost(maxMatches);
+  CHECK_CUDA(cudaMemcpy(keypointsHost.data(), keypointsDevice,
+                        keypointsSize * sizeof(int64_t),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(matchesHost.data(), matchesDevice,
+                        maxMatches * 3 * sizeof(int64_t),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(scoresHost.data(), scoresDevice,
+                        maxMatches * sizeof(float), cudaMemcpyDeviceToHost));
+
+  // Overlay keypoints on images
+  for (int b = 0; b < batchSize; ++b) {
+    cv::Mat& img = (b == 0) ? leftImg : rightImg;
+    for (int k = 0; k < 1024; ++k) {
+      int idx = b * 1024 * 2 + k * 2;
+      int x = static_cast<int>(keypointsHost[idx]);
+      int y = static_cast<int>(keypointsHost[idx + 1]);
+      if (x >= 0 && x < width && y >= 0 && y < height) {
+        cv::circle(img, cv::Point(x, y), 3, cv::Scalar(0, 255, 0), -1); // Green circles
+      }
+    }
+  }
+
+  // Save images with keypoints
+  cv::imwrite("left_0_keypoints.jpg", leftImg);
+  cv::imwrite("right_0_keypoints.jpg", rightImg);
+
+  // Create side-by-side image with matches
+  cv::Mat sideBySide(height, width * 2, leftImg.type());
+  leftImg.copyTo(sideBySide(cv::Rect(0, 0, width, height)));
+  rightImg.copyTo(sideBySide(cv::Rect(width, 0, width, height)));
+
+  // Draw matches
+  for (int m = 0; m < maxMatches; ++m) {
+    if (scoresHost[m] <= 0 || matchesHost[m * 3] < 0) break; // Stop at invalid matches
+    int batchIdx = matchesHost[m * 3];
+    if (batchIdx != 0) continue; // Only process batch 0 (L0, R0)
+    int leftIdx = matchesHost[m * 3 + 1];
+    int rightIdx = matchesHost[m * 3 + 2];
+
+    int leftX = keypointsHost[leftIdx * 2];
+    int leftY = keypointsHost[leftIdx * 2 + 1];
+    int rightX = keypointsHost[1024 * 2 + rightIdx * 2]; // Offset for right image
+    int rightY = keypointsHost[1024 * 2 + rightIdx * 2 + 1];
+
+    if (leftX >= 0 && leftY >= 0 && rightX >= 0 && rightY >= 0) {
+      cv::Point leftPt(leftX, leftY);
+      cv::Point rightPt(rightX + width, rightY); // Offset for right image
+      cv::line(sideBySide, leftPt, rightPt, cv::Scalar(0, 0, 255), 1); // Red lines
+    }
+  }
+
+  // Save side-by-side image with matches
+  cv::imwrite("matches_side_by_side.jpg", sideBySide);
+
+  // Cleanup
+  CHECK_CUDA(cudaFree(inputDevice));
+  CHECK_CUDA(cudaFree(keypointsDevice));
+  CHECK_CUDA(cudaFree(matchesDevice));
+  CHECK_CUDA(cudaFree(scoresDevice));
+
+  std::cout << "Output images saved: left_0_keypoints.jpg, right_0_keypoints.jpg, matches_side_by_side.jpg" << std::endl;
+
+  return 0;
+}

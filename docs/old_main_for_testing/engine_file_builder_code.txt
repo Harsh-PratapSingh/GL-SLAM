@@ -1,0 +1,64 @@
+#include <NvInfer.h>
+#include <NvOnnxParser.h>
+#include <iostream>
+#include <fstream>
+
+using namespace nvinfer1;
+
+class Logger : public ILogger {
+public:
+    void log(Severity severity, const char* msg) noexcept override {
+        if (severity <= Severity::kINFO)
+            std::cout << "[TRT] " << msg << std::endl;
+    }
+} gLogger;
+
+int main() {
+
+    std::string onnxPath = "/home/tomato/Desktop/Projects/GL-SLAM/third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt.onnx";
+    std::string enginePath = "/home/tomato/Desktop/Projects/GL-SLAM/third_party/Superpoint_Lightglue/light_fp16_trt.engine";
+    // 1. Create builder
+    IBuilder* builder = createInferBuilder(gLogger);
+    
+    // 2. Create network with explicit batch size
+    uint32_t explicitBatch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    INetworkDefinition* network = builder->createNetworkV2(explicitBatch);
+
+    // 3. Create ONNX parser
+    nvonnxparser::IParser* parser = nvonnxparser::createParser(*network, gLogger);
+    parser->parseFromFile("/home/tomato/Desktop/Projects/GL-SLAM/third_party/Superpoint_Lightglue/superpoint_lightglue_pipeline.trt.onnx", 2); // 2 = kINFO
+
+    // 4. Create builder config
+    IBuilderConfig* config = builder->createBuilderConfig();
+    config->setFlag(BuilderFlag::kFP16); // Enable FP16
+    config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, 1 << 30); // 1GB
+
+    // 5. Set input profile
+    IOptimizationProfile* profile = builder->createOptimizationProfile();
+    ITensor* input = network->getInput(0);
+    Dims inputDims = input->getDimensions();
+    
+    // Set static input shape: (2, 1, 1024, 1024)
+    profile->setDimensions(input->getName(), OptProfileSelector::kMIN, inputDims);
+    profile->setDimensions(input->getName(), OptProfileSelector::kOPT, inputDims);
+    profile->setDimensions(input->getName(), OptProfileSelector::kMAX, inputDims);
+    config->addOptimizationProfile(profile);
+
+    // 6. Build engine
+    ICudaEngine* engine = builder->buildEngineWithConfig(*network, *config);
+    
+    // 7. Serialize engine to file
+    IHostMemory* serializedEngine = engine->serialize();
+    std::ofstream engineFile("/home/tomato/Desktop/Projects/GL-SLAM/third_party/Superpoint_Lightglue/light_fp16_trt.engine", std::ios::binary);
+    engineFile.write(static_cast<const char*>(serializedEngine->data()), serializedEngine->size());
+
+    delete serializedEngine;
+    delete engine;
+    delete config;
+    delete parser;
+    delete network;
+    delete builder;
+
+    return 0;
+}
+
