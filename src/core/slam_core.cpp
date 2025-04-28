@@ -116,11 +116,11 @@ namespace slam_core {
     }
 
     void bundleAdjustment(std::vector<cv::Mat>& Rs_est, std::vector<cv::Mat>& Ts_est,
-                         std::vector<Point3D>& points3D, const cv::Mat& K,
-                         const std::vector<int>& window_indices) {
+                        std::vector<Point3D>& points3D, const cv::Mat& K) {
+        // Step 1: Initialize G2O optimizer
         g2o::SparseOptimizer optimizer;
         optimizer.setVerbose(true);
-
+        
         // Set up solver
         typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>> BlockSolverType;
         typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType> LinearSolverType;
@@ -128,93 +128,67 @@ namespace slam_core {
             std::make_unique<BlockSolverType>(std::make_unique<LinearSolverType>()));
         optimizer.setAlgorithm(solver);
 
-        // Map global camera indices to local vertex IDs
-        std::unordered_map<int, int> cam_idx_to_vertex_id;
+        // Step 2: Add camera poses as vertices
         std::vector<g2o::VertexSE3Expmap*> camera_vertices;
-        for (size_t i = 0; i < window_indices.size(); ++i) {
-            int cam_idx = window_indices[i];
-            if (cam_idx < 0 || cam_idx >= Rs_est.size()) continue;
-
+        for (size_t i = 0; i < Rs_est.size(); ++i) {
             Eigen::Matrix3d R_eigen;
-            cv::cv2eigen(Rs_est[cam_idx], R_eigen);
+            cv::cv2eigen(Rs_est[i], R_eigen);
             Eigen::Vector3d T_eigen;
-            cv::cv2eigen(Ts_est[cam_idx], T_eigen);
+            cv::cv2eigen(Ts_est[i], T_eigen);
             g2o::SE3Quat pose(R_eigen, T_eigen);
 
             g2o::VertexSE3Expmap* v_se3 = new g2o::VertexSE3Expmap();
             v_se3->setEstimate(pose);
             v_se3->setId(i);
-            if (i == 0) v_se3->setFixed(true); // Fix the oldest pose in the window
+            if (i == 0) v_se3->setFixed(true); // Fix first camera
             optimizer.addVertex(v_se3);
             camera_vertices.push_back(v_se3);
-            cam_idx_to_vertex_id[cam_idx] = i;
         }
 
-        // Identify 3D points observed in the window
-        std::unordered_set<int> relevant_point_indices;
-        for (size_t i = 0; i < points3D.size(); ++i) {
-            for (const auto& obs : points3D[i].observations) {
-                if (std::find(window_indices.begin(), window_indices.end(), obs.camera_idx) != window_indices.end()) {
-                    relevant_point_indices.insert(i);
-                    break;
-                }
-            }
-        }
-
-        // Add 3D points as vertices
-        std::unordered_map<int, int> point_idx_to_vertex_id;
+        // Step 3: Add 3D points as vertices
         std::vector<g2o::VertexPointXYZ*> point_vertices;
-        int vertex_id = window_indices.size();
-        for (int point_idx : relevant_point_indices) {
+        for (size_t i = 0; i < points3D.size(); ++i) {
             g2o::VertexPointXYZ* v_point = new g2o::VertexPointXYZ();
-            Eigen::Vector3d point_eigen(points3D[point_idx].position.x, points3D[point_idx].position.y, points3D[point_idx].position.z);
+            Eigen::Vector3d point_eigen(points3D[i].position.x, points3D[i].position.y, points3D[i].position.z);
             v_point->setEstimate(point_eigen);
-            v_point->setId(vertex_id);
+            v_point->setId(i + Rs_est.size());
             v_point->setMarginalized(true);
             optimizer.addVertex(v_point);
             point_vertices.push_back(v_point);
-            point_idx_to_vertex_id[point_idx] = vertex_id;
-            vertex_id++;
         }
 
-        // Add camera parameters
+        // Step 4: Add edges for observations
         g2o::CameraParameters* cam_params = new g2o::CameraParameters(
             K.at<double>(0,0), Eigen::Vector2d(K.at<double>(0,2), K.at<double>(1,2)), 0);
         cam_params->setId(0);
         optimizer.addParameter(cam_params);
 
-        // Add edges for observations within the window
-        for (int point_idx : relevant_point_indices) {
-            for (const auto& obs : points3D[point_idx].observations) {
-                if (cam_idx_to_vertex_id.find(obs.camera_idx) != cam_idx_to_vertex_id.end()) {
-                    g2o::EdgeProjectXYZ2UV* edge = new g2o::EdgeProjectXYZ2UV();
-                    edge->setVertex(0, point_vertices[point_idx_to_vertex_id[point_idx] - window_indices.size()]);
-                    edge->setVertex(1, camera_vertices[cam_idx_to_vertex_id[obs.camera_idx]]);
-                    Eigen::Vector2d measurement(obs.point2D.x, obs.point2D.y);
-                    edge->setMeasurement(measurement);
-                    edge->setInformation(Eigen::Matrix2d::Identity());
-                    edge->setParameterId(0, 0);
-                    optimizer.addEdge(edge);
-                }
+        for (size_t i = 0; i < points3D.size(); ++i) {
+            for (const auto& obs : points3D[i].observations) {
+                g2o::EdgeProjectXYZ2UV* edge = new g2o::EdgeProjectXYZ2UV();
+                edge->setVertex(0, point_vertices[i]);
+                edge->setVertex(1, camera_vertices[obs.camera_idx]);
+                Eigen::Vector2d measurement(obs.point2D.x, obs.point2D.y);
+                edge->setMeasurement(measurement);
+                edge->setInformation(Eigen::Matrix2d::Identity());
+                edge->setParameterId(0, 0);
+                optimizer.addEdge(edge);
             }
         }
 
-        // Optimize
+        // Step 5: Optimize
         optimizer.initializeOptimization();
-        optimizer.optimize(10); // Fewer iterations for sliding window
+        optimizer.optimize(30);
 
-        // Update poses and points
-        for (size_t i = 0; i < window_indices.size(); ++i) {
-            int cam_idx = window_indices[i];
-            if (cam_idx < 0 || cam_idx >= Rs_est.size()) continue;
+        // Step 6: Update poses and points
+        for (size_t i = 0; i < camera_vertices.size(); ++i) {
             g2o::SE3Quat optimized_pose = camera_vertices[i]->estimate();
-            cv::eigen2cv(optimized_pose.rotation().toRotationMatrix(), Rs_est[cam_idx]);
-            cv::eigen2cv(optimized_pose.translation(), Ts_est[cam_idx]);
+            cv::eigen2cv(optimized_pose.rotation().toRotationMatrix(), Rs_est[i]);
+            cv::eigen2cv(optimized_pose.translation(), Ts_est[i]);
         }
-        for (int point_idx : relevant_point_indices) {
-            int v_id = point_idx_to_vertex_id[point_idx] - window_indices.size();
-            Eigen::Vector3d optimized_point = point_vertices[v_id]->estimate();
-            points3D[point_idx].position = cv::Point3f(optimized_point[0], optimized_point[1], optimized_point[2]);
+        for (size_t i = 0; i < point_vertices.size(); ++i) {
+            Eigen::Vector3d optimized_point = point_vertices[i]->estimate();
+            points3D[i].position = cv::Point3f(optimized_point[0], optimized_point[1], optimized_point[2]);
         }
     }
 
