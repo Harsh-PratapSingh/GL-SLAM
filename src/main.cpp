@@ -6,11 +6,12 @@
 #include <sstream>
 #include <unordered_set>
 
-const int num_images = 200;
-const int window_size = 100; // Sliding window size
+const int num_images = 101;
+const int window_size = 30; // Sliding window size
 std::vector<cv::Mat> Rs_gt(num_images), Ts_gt(num_images);
 std::vector<cv::Mat> Rs_est(num_images), Ts_est(num_images);
 std::vector<Point3D> global_points3D;
+std::vector<Point3D> temp_points3D;
 cv::Mat K;
 
 
@@ -115,11 +116,13 @@ int main() {
     std::vector<int> prev_points2_indices;
     int gidx = 0;
     int c =0 ;
+    int last_valid_frame2 = 1;
+    int last_valid_frame1 = 0;
 
     for (int i = 0; i < num_images - 1; ++i) {
         std::ostringstream oss1, oss2;
-        oss1 << dir_path << "image_0/" << std::setw(6) << std::setfill('0') << i << ".png";
-        oss2 << dir_path << "image_0/" << std::setw(6) << std::setfill('0') << (i+1) << ".png";
+        oss1 << dir_path << "image_0/" << std::setw(6) << std::setfill('0') << last_valid_frame1 << ".png";
+        oss2 << dir_path << "image_0/" << std::setw(6) << std::setfill('0') << last_valid_frame2 << ".png";
 
         cv::Mat img1 = cv::imread(oss1.str(), cv::IMREAD_GRAYSCALE);
         cv::Mat img2 = cv::imread(oss2.str(), cv::IMREAD_GRAYSCALE);
@@ -130,6 +133,19 @@ int main() {
 
         std::vector<cv::Point2f> points1, points2;
         slam_core::process_keypoints(infer, img1, img2, points1, points2, i);
+
+        // Optical Flow Magnitude Check
+        double total_displacement = 0.0;
+        for (size_t j = 0; j < points1.size(); ++j) {
+            total_displacement += cv::norm(points2[j] - points1[j]);
+        }
+        double avg_displacement = total_displacement / points1.size();
+        if (avg_displacement < 4.0) {
+            std::cout << "Skipping frame " << last_valid_frame2 << " ,avg_displacement=" << avg_displacement << " pixels)\n";
+            i--;
+            last_valid_frame2++;
+            continue;
+        }
 
         cv::Mat R_rel, T_rel;
         cv::Mat mask;
@@ -243,6 +259,14 @@ int main() {
             c =0;
         }
         c++;
+        if(last_valid_frame2-last_valid_frame1 > 1){
+            last_valid_frame1 = last_valid_frame2 ;
+            last_valid_frame2++;
+        }
+        else{
+            last_valid_frame1++;
+            last_valid_frame2++;
+        }
         
     //     // Sliding window bundle adjustment
     //     if (i >= window_size - 2) {
@@ -289,23 +313,32 @@ int main() {
     //     }
     }
 
+
     int p = 0;
     for (size_t k = 0; k < global_points3D.size(); ++k) {
         int l = 0;
         for (const auto& obs : global_points3D[k].observations) {
             l++;
         }
-        if (l > 3) {
+        if (l > 2) {
+            temp_points3D.push_back(global_points3D[k]);
             p++;
         }
     }
-    std::cout << "points " << p << " in over 5 Camera\n";
+    global_points3D = temp_points3D;
+    temp_points3D.clear();
+    std::cout << "points " << p << " in over 4 Camera\n";
 
     // Compute reprojection errors
     double total_error = 0.0;
     int num_observations = 0;
+    int bad_obs = 0;
+    int good_obs = 0;
+    int worse_obs = 0;
+    int multi_obs = 0;
     std::vector<double> reprojection_errors;
     for (size_t point_idx = 0; point_idx < global_points3D.size(); ++point_idx) {
+        int o = 0;
         const auto& point3D = global_points3D[point_idx];
         cv::Point3f X = point3D.position;
         for (const auto& obs : point3D.observations) {
@@ -328,6 +361,19 @@ int main() {
             total_error += err;
             num_observations++;
             reprojection_errors.push_back(err);
+            if(err >= 2){
+                bad_obs++;
+            }
+            if (err <= 0.3){
+                good_obs++;
+            }
+            if (err >= 4){
+                worse_obs++;
+            }
+            o++;
+        }
+        if (o >=5){
+            multi_obs++;
         }
     }
 
@@ -339,6 +385,11 @@ int main() {
         double min_error = *std::min_element(reprojection_errors.begin(), reprojection_errors.end());
         std::cout << "Max reprojection error: " << max_error << " pixels\n";
         std::cout << "Min reprojection error: " << min_error << " pixels\n";
+        std::cout << "Bad observations > 2 pixels: " << bad_obs << " \n";
+        std::cout << "Worse observations > 4 pixels: " << worse_obs << " \n";
+        std::cout << "good observations < 0.5 pixels: " << good_obs << " \n";
+        std::cout << "No. of points:" << global_points3D.size() << " \n";
+        std::cout << "points observer in cameras >=5 " << multi_obs << "\n";
     } else {
         std::cout << "No observations available to compute reprojection error.\n";
     }
