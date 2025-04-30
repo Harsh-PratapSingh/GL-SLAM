@@ -301,4 +301,84 @@ namespace slam_core {
         points1 = filtered_points1;
         points2 = filtered_points2;
     }
+
+    void processSlidingWindowBA(const int i, const int window_size, const cv::Mat K, std::vector<cv::Mat> &Rs_est, 
+                                std::vector<cv::Mat> &Ts_est, std::vector<Point3D> &global_points3D) {
+        if (i < window_size - 1) return; // Wait until we have enough frames
+    
+        // Step 1: Define the window (last window_size frames)
+        int start_idx = std::max(0, i + 1 - window_size); // Ensure we don’t go below 0
+        int end_idx = i + 1;                              // Include the current frame
+        std::vector<int> window_indices;
+        for (int j = start_idx; j <= end_idx; ++j) {
+            window_indices.push_back(j);
+        }
+    
+        // Step 2: Extract poses for the window
+        std::vector<cv::Mat> Rs_window, Ts_window;
+        for (int idx : window_indices) {
+            cv::Mat temp1 = Rs_est[idx].clone();
+            cv::Mat temp2 = Ts_est[idx].clone();
+            temp1 = temp1.t();
+            temp2 = -temp1 * temp2;
+            Rs_window.push_back(temp1); // Clone to avoid modifying global data yet
+            Ts_window.push_back(temp2);
+        }
+    
+        // Step 3: Identify 3D points observed in the window
+        std::unordered_set<int> relevant_point_indices;
+        for (size_t pt_idx = 0; pt_idx < global_points3D.size(); ++pt_idx) {
+            for (const auto& obs : global_points3D[pt_idx].observations) {
+                if (std::find(window_indices.begin(), window_indices.end(), obs.camera_idx) != window_indices.end()) {
+                    relevant_point_indices.insert(pt_idx);
+                    break; // Point is relevant if seen in any window frame
+                }
+            }
+        }
+    
+        // Step 4: Create window-specific points with remapped observations
+        std::vector<Point3D> points_window;
+        std::unordered_map<int, int> global_to_local_pt_idx; // Maps global point index to local
+        int local_pt_idx = 0;
+        for (int pt_idx : relevant_point_indices) {
+            Point3D local_pt;
+            local_pt.position = global_points3D[pt_idx].position;
+            for (const auto& obs : global_points3D[pt_idx].observations) {
+                auto it = std::find(window_indices.begin(), window_indices.end(), obs.camera_idx);
+                if (it != window_indices.end()) {
+                    // Remap global camera index to local window index (0-based in window)
+                    int local_cam_idx = std::distance(window_indices.begin(), it);
+                    local_pt.observations.push_back({local_cam_idx, obs.point2D});
+                }
+            }
+            if (!local_pt.observations.empty()) {
+                points_window.push_back(local_pt);
+                global_to_local_pt_idx[pt_idx] = local_pt_idx++;
+            }
+        }
+    
+        // Step 5: Call the original bundle adjustment function
+        std::cout << "Running sliding window BA for frames " << start_idx << " to " << end_idx << "...\n";
+        slam_core::bundleAdjustment(Rs_window, Ts_window, points_window, K);
+        std::cout << "Sliding window BA completed.\n";
+    
+        // Step 6: Update global poses with optimized values
+        for (size_t j = 0; j < window_indices.size(); ++j) {
+            int global_idx = window_indices[j];
+            cv::Mat temp1 = Rs_window[j].clone();
+            cv::Mat temp2 = Ts_window[j].clone();
+            temp1 = temp1.t();
+            temp2 = -temp1 * temp2;
+            Rs_est[global_idx] = temp1;
+            Ts_est[global_idx] = temp2;
+        }
+    
+        // Step 7: Update global points with optimized values
+        for (const auto& pair : global_to_local_pt_idx) {
+            int global_pt_idx = pair.first;
+            int local_pt_idx = pair.second;
+            global_points3D[global_pt_idx].position = points_window[local_pt_idx].position;
+        }
+    }
+
 }

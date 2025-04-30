@@ -37,4 +37,7 @@ namespace slam_core {
     void process_keypoints(TensorRTInference& infer, const cv::Mat& img1, const cv::Mat& img2,
                           std::vector<cv::Point2f>& points1, std::vector<cv::Point2f>& points2,
                           int i);
+
+    void processSlidingWindowBA(const int i, const int window_size, const cv::Mat K, std::vector<cv::Mat> &Rs_est, 
+                                std::vector<cv::Mat> &Ts_est, std::vector<Point3D> &global_points3D);
 }
