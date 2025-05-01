@@ -6,8 +6,8 @@
 #include <sstream>
 #include <unordered_set>
 
-const int num_images = 101;
-const int window_size = 30; // Sliding window size
+const int num_images = 201;
+const int window_size = 100; // Sliding window size
 std::vector<cv::Mat> Rs_gt(num_images), Ts_gt(num_images);
 std::vector<cv::Mat> Rs_est(num_images), Ts_est(num_images);
 std::vector<Point3D> global_points3D;
