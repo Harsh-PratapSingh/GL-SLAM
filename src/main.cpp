@@ -6,9 +6,10 @@
 #include <sstream>
 #include <unordered_set>
 
-const int num_images = 201;
+const int num_images = 500;
 const int window_size = 100; // Sliding window size //tested 30 and 100 to be ok
-std::vector<cv::Mat> Rs_gt(num_images), Ts_gt(num_images);
+
+std::vector<cv::Mat> Rs_gt(num_images*3), Ts_gt(num_images*3);
 std::vector<cv::Mat> Rs_est(num_images), Ts_est(num_images);
 std::vector<Point3D> global_points3D;
 std::vector<Point3D> temp_points3D;
@@ -22,9 +23,9 @@ int main() {
 
     K = slam_core::load_calibration(dir_path + "calib.txt");
 
-    auto poses = slam_core::load_poses(dir_path + "00.txt", num_images);
+    auto poses = slam_core::load_poses(dir_path + "00.txt", num_images*3);
     
-    for (int i = 0; i < num_images; ++i) {
+    for (int i = 0; i < num_images*3; ++i) {
         Rs_gt[i] = poses[i](cv::Rect(0, 0, 3, 3));
         Ts_gt[i] = poses[i](cv::Rect(3, 0, 1, 3));
     }
@@ -62,7 +63,7 @@ int main() {
             total_displacement += cv::norm(points2[j] - points1[j]);
         }
         double avg_displacement = total_displacement / points1.size();
-        if (avg_displacement < 4.0) {
+        if (avg_displacement < 10.0) {
             std::cout << "Skipping frame " << last_valid_frame2 << " ,avg_displacement=" << avg_displacement << " pixels)\n";
             i--;
             last_valid_frame2++;
@@ -172,9 +173,9 @@ int main() {
         std::cout << "Mask: " << points1.size() << " \n";
         std::cout << "Image " << i + 1 << ":\n";
         std::cout << "Estimated T: " << Ts_est[i + 1].t() << "\n";
-        std::cout << "Ground Truth T: " << Ts_gt[i + 1].t() << "\n";
-        std::cout << "Rotation Error: " << slam_core::compute_rotation_error(Rs_est[i + 1], Rs_gt[i + 1]) << " deg\n";
-        std::cout << "Translation Error: " << slam_core::compute_translation_error(Ts_est[i + 1], Ts_gt[i + 1]) << " deg\n";
+        std::cout << "Ground Truth T: " << Ts_gt[last_valid_frame2].t() << "\n";
+        std::cout << "Rotation Error: " << slam_core::compute_rotation_error(Rs_est[i + 1], Rs_gt[last_valid_frame2]) << " deg\n";
+        std::cout << "Translation Error: " << slam_core::compute_translation_error(Ts_est[i + 1], Ts_gt[last_valid_frame2]) << " deg\n";
         
         if(c >= window_size/3){
             slam_core::processSlidingWindowBA(i, window_size, K, Rs_est, Ts_est, global_points3D);
