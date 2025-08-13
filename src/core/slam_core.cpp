@@ -68,22 +68,22 @@ namespace slam_core {
     //     return points3D;
     // }
 
-    // cv::Mat load_calibration(const std::string& path) {
-    //     std::ifstream file(path);
-    //     std::string line;
-    //     while (std::getline(file, line)) {
-    //         if (line.substr(0, 2) == "P0") {
-    //             std::istringstream iss(line.substr(4));
-    //             cv::Mat P0(3, 4, CV_64F);
-    //             for (int i = 0; i < 12; ++i) iss >> P0.at<double>(i / 4, i % 4);
-    //             cv::Mat K = P0(cv::Rect(0, 0, 3, 3));
-    //             std::cout << "Loaded calibration matrix K:\n" << K << "\n";
-    //             return K;
-    //         }
-    //     }
-    //     std::cerr << "P0 not found\n";
-    //     exit(-1);
-    // }
+    cv::Mat load_calibration(const std::string& path) {
+        std::ifstream file(path);
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.substr(0, 2) == "P0") {
+                std::istringstream iss(line.substr(4));
+                cv::Mat P0(3, 4, CV_64F);
+                for (int i = 0; i < 12; ++i) iss >> P0.at<double>(i / 4, i % 4);
+                cv::Mat K = P0(cv::Rect(0, 0, 3, 3));
+                std::cout << "Loaded calibration matrix K:\n" << K << "\n";
+                return K;
+            }
+        }
+        std::cerr << "P0 not found\n";
+        exit(-1);
+    }
 
     // std::vector<cv::Mat> load_poses(const std::string& path, int num_poses) {
     //     std::ifstream file(path);
@@ -250,9 +250,6 @@ namespace slam_core {
         std::vector<float> scores_right;
         infer.runInference("img1_right.png", "img2_right.png", keypoints_right, matches_right, scores_right);
 
-        // These two constants must match your model parsing logic from v1
-        const int MODEL_IMAGE_SIZE = /* set to your model's max keypoints per image, e.g. 4096 or 1024*1024 indices space if dense */ 1024;
-        const float SCORE_THRESHOLD = 0.95f;
 
         uint16_t i = 0;
 

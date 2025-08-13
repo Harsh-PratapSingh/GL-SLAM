@@ -7,7 +7,7 @@
 #include <vector>
 #include <string>
 
-constexpr float SCORE_THRESHOLD = 0.70f;
+constexpr float SCORE_THRESHOLD = 0.5f;
 constexpr int IMAGE_WIDTH = 1241;
 constexpr int IMAGE_HEIGHT = 376;
 constexpr int MODEL_IMAGE_SIZE = 1024;
@@ -20,7 +20,7 @@ namespace slam_core {
     //                                           const cv::Mat& mask,
     //                                           const std::vector<int>& exclude_indices);
 
-    // cv::Mat load_calibration(const std::string& path);
+    cv::Mat load_calibration(const std::string& path);
 
     // std::vector<cv::Mat> load_poses(const std::string& path, int num_poses);
 
