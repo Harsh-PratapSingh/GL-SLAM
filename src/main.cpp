@@ -8,7 +8,6 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
-#include <unordered_map>
 
 // Custom logger for TensorRT
 class Logger : public nvinfer1::ILogger {
@@ -20,7 +19,7 @@ public:
     }
 };
 
-// Function to load ONNX model and build TensorRT engine
+// Function to load ONNX model and build TensorRT engine (no extra num_keypoints output)
 std::shared_ptr<nvinfer1::ICudaEngine> buildEngine(const std::string& onnxFile, Logger& logger) {
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(logger));
     if (!builder) return nullptr;
@@ -37,36 +36,6 @@ std::shared_ptr<nvinfer1::ICudaEngine> buildEngine(const std::string& onnxFile, 
 
     auto parsed = parser->parseFromFile(onnxFile.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING));
     if (!parsed) return nullptr;
-
-    // Find the keypoints output tensor by name
-    nvinfer1::ITensor* keypointsTensor = nullptr;
-    for (int i = 0; i < network->getNbOutputs(); ++i) {
-        auto output = network->getOutput(i);
-        if (std::string(output->getName()) == "keypoints") {
-            keypointsTensor = output;
-            break;
-        }
-    }
-    if (!keypointsTensor) {
-        std::cerr << "Failed to find keypoints output" << std::endl;
-        return nullptr;
-    }
-
-    // Add a shape layer to get the shape of keypoints [1, num, 2]
-    auto shapeLayer = network->addShape(*keypointsTensor);
-    auto shapeTensor = shapeLayer->getOutput(0);
-
-    // Slice to get the second dimension (num)
-    nvinfer1::Dims start{1, {1}};
-    nvinfer1::Dims size{1, {1}};
-    nvinfer1::Dims stride{1, {1}};
-    auto sliceLayer = network->addSlice(*shapeTensor, start, size, stride);
-    auto numTensor = sliceLayer->getOutput(0);
-
-    // Mark as output
-    numTensor->setName("num_keypoints");
-    numTensor->setType(nvinfer1::DataType::kINT32);
-    network->markOutput(*numTensor);
 
     // Set optimization profile for dynamic shapes
     auto profile = builder->createOptimizationProfile();
@@ -122,7 +91,7 @@ void saveEngine(const nvinfer1::ICudaEngine& engine, const std::string& engineFi
 int main() {
     // Hardcoded paths since no args are needed for the executable
     std::string onnxFile = "superpoint_2048.onnx";  // Replace with your actual ONNX file path
-    std::string imagePath = "temp1.png";  // Replace with your actual image file path
+    std::string imagePath = "temp3.png";  // Replace with your actual image file path
     std::string engineFile = "superpoint_2048.engine";  // Engine file to save/load
 
     Logger logger;
@@ -156,9 +125,9 @@ int main() {
         return -1;
     }
 
-    // Resize to a fixed size (adjust based on model; example 480x640)
-    cv::Mat resized;
-    cv::resize(image, resized, cv::Size(1024, 1024));
+    // Resize to a fixed size (adjust based on model; example 1024x1024 as in your code)
+    cv::Mat resized = image.clone();
+
 
     // Normalize to [0,1] float32
     resized.convertTo(resized, CV_32F, 1.0 / 255.0);
@@ -181,7 +150,6 @@ int main() {
     void* d_keypoints = nullptr;
     void* d_scores = nullptr;
     void* d_descriptors = nullptr;
-    void* d_num_keypoints = nullptr;
 
     // Allocate input buffer using exact shape
     auto imageShape = context->getTensorShape("image");
@@ -197,8 +165,7 @@ int main() {
     // Allocate output buffers with max size
     if (cudaMalloc(&d_keypoints, 1 * maxKeypoints * 2 * sizeof(int64_t)) != cudaSuccess ||
         cudaMalloc(&d_scores, 1 * maxKeypoints * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&d_descriptors, 1 * maxKeypoints * 256 * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&d_num_keypoints, sizeof(int32_t)) != cudaSuccess) {
+        cudaMalloc(&d_descriptors, 1 * maxKeypoints * 256 * sizeof(float)) != cudaSuccess) {
         std::cerr << "Failed to allocate output buffers" << std::endl;
         return -1;
     }
@@ -206,40 +173,40 @@ int main() {
     // Copy input to device
     cudaMemcpy(d_image, inputData.data(), inputData.size() * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Prepare bindings array for executeV2 (order: image, keypoints, scores, descriptors, num_keypoints)
+    // Prepare bindings array (order: input 'image', output 'keypoints', 'scores', 'descriptors')
     std::vector<void*> bindings = {d_image, d_keypoints, d_scores, d_descriptors};
 
-    // Run inference
+    // Run inference with bindings array
     bool status = context->executeV2(bindings.data());
     if (!status) {
         std::cerr << "Inference failed" << std::endl;
         return -1;
     }
 
-    // Get actual number of keypoints from the new output
-    int32_t numKeypoints = 0;
-    cudaMemcpy(&numKeypoints, d_num_keypoints, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    // Allocate host buffers with max size
+    std::vector<int64_t> keypoints(maxKeypoints * 2);
+    std::vector<float> scores(maxKeypoints);
+    std::vector<float> descriptors(maxKeypoints * 256);
 
-    std::cout << "keypoints " << d_keypoints;
-
-    if (numKeypoints < 0 || numKeypoints > maxKeypoints) {
-        std::cerr << "Invalid number of keypoints: " << numKeypoints << std::endl;
-        return -1;
-    }
-
-    // Allocate host buffers for outputs with actual size
-    std::vector<int64_t> keypoints(4096);
-    std::vector<float> scores(2048);
-    std::vector<float> descriptors(2048 * 256);
-
-    // Copy outputs from device (using actual size)
+    // Copy outputs from device (full max size)
     cudaMemcpy(keypoints.data(), d_keypoints, keypoints.size() * sizeof(int64_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(scores.data(), d_scores, scores.size() * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(descriptors.data(), d_descriptors, descriptors.size() * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // Print some results (example: first few keypoints)
+    // Determine actual number by counting valid scores (adjust threshold if needed)
+    int numKeypoints = 0;
+    const float scoreThreshold = 0.0f;  // Common threshold for SuperPoint; tune based on your model
+    for (int i = 0; i < maxKeypoints; ++i) {
+        if (scores[i] > scoreThreshold) {
+            ++numKeypoints;
+        } else {
+            break;  // Assuming sorted or padded with low scores at the end
+        }
+    }
+
+    // Print results
     std::cout << "Detected " << numKeypoints << " keypoints (up to 2048)" << std::endl;
-    for (int i = 0; i < 1500; ++i) {
+    for (int i = 0; i < std::min(2048, numKeypoints); ++i) {
         std::cout << "Keypoint " << i << ": (" << keypoints[i * 2] << ", " << keypoints[i * 2 + 1]
                   << ") Score: " << scores[i] << std::endl;
     }
@@ -249,7 +216,6 @@ int main() {
     cudaFree(d_keypoints);
     cudaFree(d_scores);
     cudaFree(d_descriptors);
-    cudaFree(d_num_keypoints);
 
     return 0;
 }
