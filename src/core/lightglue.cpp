@@ -88,12 +88,12 @@ bool LightGlueTRT::buildAndSaveEngine(const std::string& onnxPath, const std::st
     if (!profile) return false;
 
     // Ranges (adjust as needed)
-    nvinfer1::Dims kptsMin{3, {1, 2048, 2}};
-    nvinfer1::Dims kptsOpt{3, {1, 2048, 2}};
+    nvinfer1::Dims kptsMin{3, {1, 1, 2}};
+    nvinfer1::Dims kptsOpt{3, {1, 1024, 2}};
     nvinfer1::Dims kptsMax{3, {1, 2048, 2}};
 
-    nvinfer1::Dims descMin{3, {1, 2048, 256}};
-    nvinfer1::Dims descOpt{3, {1, 2048, 256}};
+    nvinfer1::Dims descMin{3, {1, 1, 256}};
+    nvinfer1::Dims descOpt{3, {1, 1024, 256}};
     nvinfer1::Dims descMax{3, {1, 2048, 256}};
 
     profile->setDimensions("kpts0", nvinfer1::OptProfileSelector::kMIN, kptsMin);
