@@ -61,7 +61,7 @@ private:
 
     bool loadEngineFromFile(const std::string& enginePath);
 
-    static bool cudaOK(cudaError_t e, const char* what);
+    bool cudaOK(cudaError_t e);
 
 private:
     Logger logger_;

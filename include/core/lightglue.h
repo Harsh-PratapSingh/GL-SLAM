@@ -53,7 +53,7 @@ private:
     bool loadEngineFromFile(const std::string& enginePath);
 
     // Helpers
-    static bool cudaOK(cudaError_t e, const char* what);
+    bool cudaOK(cudaError_t e);
     bool setInputShapes(int N0, int N1);
 
 private:
