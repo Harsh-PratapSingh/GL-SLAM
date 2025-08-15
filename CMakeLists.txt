@@ -52,9 +52,11 @@ add_library(core
     src/core/TensorRTEngineBuilder.cpp    
     src/core/tensorrt_inference.cpp
     src/core/slam_core.cpp
+    src/core/lightglue.cpp
+    src/core/superpoint.cpp
 )
 target_include_directories(core PUBLIC 
-    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/include/
     ${OpenCV_INCLUDE_DIRS}
     ${Pangolin_INCLUDE_DIRS}
     ${g2o_INCLUDE_DIRS}
