@@ -3,7 +3,7 @@
 #include <NvInferRuntime.h>
 #include <NvOnnxParser.h>
 #include <cuda_runtime_api.h>
-
+#include <opencv2/opencv.hpp>
 #include <memory>
 #include <string>
 #include <vector>
@@ -41,7 +41,9 @@ public:
     // The method internally sets input shape [1,1,H,W], allocates device buffers,
     // runs inference, copies outputs, and counts valid keypoints by scoreThreshold_.
     // Returns true on success and fills 'out'.
-    bool runInference(const float* imageData, int height, int width, Result& out);
+    Result runInference(cv::Mat& img, int height, int width);
+
+    
 
 private:
     class Logger : public nvinfer1::ILogger {

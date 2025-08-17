@@ -2,6 +2,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <opencv2/opencv.hpp>
 
 namespace {
 inline int getBindingIndexByName(const nvinfer1::ICudaEngine& eng, const char* name) {
@@ -92,11 +93,16 @@ bool SuperPointTRT::loadEngineFromFile(const std::string& enginePath) {
     return engine_ != nullptr;
 }
 
-bool SuperPointTRT::runInference(const float* imageData, int height, int width, Result& out) {
-    if (!imageData) return false;
+
+SuperPointTRT::Result SuperPointTRT::runInference(cv::Mat& img, int height, int width) {
+    img.convertTo(img, CV_32F, 1.0/255.0);
+    const float* imageData = reinterpret_cast<const float*>(img.data);
+    Result out;
+
+    if (!imageData) return out;
 
     nvinfer1::Dims inputDims{4, {1, 1, height, width}};
-    if (!context_->setInputShape("image", inputDims)) return false;
+    if (!context_->setInputShape("image", inputDims)) return out;
 
     void* d_image = nullptr; void* d_keypoints = nullptr; void* d_scores = nullptr; void* d_descriptors = nullptr;
 
@@ -108,12 +114,12 @@ bool SuperPointTRT::runInference(const float* imageData, int height, int width, 
     if (!cudaOK(cudaMalloc(&d_image, sz_image)) || !cudaOK(cudaMalloc(&d_keypoints, sz_keypoints)) ||
         !cudaOK(cudaMalloc(&d_scores, sz_scores)) || !cudaOK(cudaMalloc(&d_descriptors, sz_desc))) {
         cudaFree(d_image); cudaFree(d_keypoints); cudaFree(d_scores); cudaFree(d_descriptors);
-        return false;
+        return out;
     }
 
     if (!cudaOK(cudaMemcpy(d_image, imageData, sz_image, cudaMemcpyHostToDevice))) {
         cudaFree(d_image); cudaFree(d_keypoints); cudaFree(d_scores); cudaFree(d_descriptors);
-        return false;
+        return out;
     }
 
     const int nb = engine_->getNbIOTensors();
@@ -125,7 +131,7 @@ bool SuperPointTRT::runInference(const float* imageData, int height, int width, 
 
     if (!context_->executeV2(bindings.data())) {
         cudaFree(d_image); cudaFree(d_keypoints); cudaFree(d_scores); cudaFree(d_descriptors);
-        return false;
+        return out;
     }
 
     out.keypoints.resize(static_cast<size_t>(maxKeypoints_) * 2);
@@ -138,7 +144,7 @@ bool SuperPointTRT::runInference(const float* imageData, int height, int width, 
 
     cudaFree(d_image); cudaFree(d_keypoints); cudaFree(d_scores); cudaFree(d_descriptors);
 
-    if (!ok) return false;
+    if (!ok) return out;
 
     int valid = 0;
     for (int i = 0; i < maxKeypoints_; ++i) {
@@ -146,5 +152,5 @@ bool SuperPointTRT::runInference(const float* imageData, int height, int width, 
         else break;
     }
     out.numValid = valid;
-    return true;
+    return out;
 }

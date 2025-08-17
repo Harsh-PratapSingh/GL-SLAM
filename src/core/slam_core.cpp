@@ -416,4 +416,20 @@ namespace slam_core {
     //     }
     // }
 
+
+    void superpoint_lightglue_init(SuperPointTRT& sp, LightGlueTRT& lg){
+        sp.setWorkspaceSizeBytes(2ULL << 30);
+        sp.setMaxKeypoints(2048);
+        sp.setScoreThreshold(0.0f);
+        const int spH = 376;
+        const int spW = 1241;
+        if (!sp.init("superpoint_2048.onnx", "superpoint_2048.engine", spH, spW)) {
+            throw std::runtime_error("SuperPoint init failed");
+        }
+        if (!lg.init("superpoint_lightglue.onnx", "superpoint_lightglue.engine")) {
+            throw std::runtime_error("LightGlueTRT init failed");
+        }
+    }
+
+
 }

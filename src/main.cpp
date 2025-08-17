@@ -1,12 +1,12 @@
 #include "core/lightglue.h"
 #include "core/superpoint.h"
+#include "core/slam_core.h"
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
 #include <cmath>
-#include <random>
 
 static void drawSuperPointKpts(cv::Mat& imgBgr, const std::vector<float>& kptsXY, int N,
                                const cv::Scalar& color = cv::Scalar(0, 255, 0),
@@ -19,23 +19,21 @@ static void drawSuperPointKpts(cv::Mat& imgBgr, const std::vector<float>& kptsXY
 }
 
 static cv::Mat concatHorizontalSameSize(const cv::Mat& left, const cv::Mat& right) {
-    // assumes both are same size/type
     cv::Mat out(left.rows, left.cols + right.cols, left.type());
     left.copyTo(out(cv::Rect(0, 0, left.cols, left.rows)));
     right.copyTo(out(cv::Rect(left.cols, 0, right.cols, right.rows)));
     return out;
 }
 
-static void drawLightGlueMatches(cv::Mat& vis,                      // BGR concat image (img0 | img1)
-                                 int img0Width,                     // width of left image
-                                 const std::vector<float>& kpts0,   // [N0,2]
-                                 const std::vector<float>& kpts1,   // [N1,2]
-                                 const std::vector<int64_t>& matches0, // [N0]
-                                 const std::vector<float>& mscores0,   // [N0]
+static void drawLightGlueMatches(cv::Mat& vis,
+                                 int img0Width,
+                                 const std::vector<float>& kpts0,
+                                 const std::vector<float>& kpts1,
+                                 const std::vector<int64_t>& matches0,
+                                 const std::vector<float>& mscores0,
                                  int N0, int N1,
                                  int maxToDraw = 500,
                                  float minScore = 0.0f) {
-    // Optionally collect matched indices with scores for sorting by confidence
     struct M { int i; int j; float s; };
     std::vector<M> mlist;
     mlist.reserve(N0);
@@ -48,209 +46,76 @@ static void drawLightGlueMatches(cv::Mat& vis,                      // BGR conca
             }
         }
     }
-
-    // Sort by score descending (optional), then draw top K
     std::sort(mlist.begin(), mlist.end(), [](const M& a, const M& b){ return a.s > b.s; });
     if ((int)mlist.size() > maxToDraw) mlist.resize(maxToDraw);
 
-    // Color map: stronger score => greener/brighter
     for (const auto& m : mlist) {
         float x0 = kpts0[size_t(m.i)*2 + 0];
         float y0 = kpts0[size_t(m.i)*2 + 1];
-        float x1 = kpts1[size_t(m.j)*2 + 0] + img0Width;  // shift for concatenated image
+        float x1 = kpts1[size_t(m.j)*2 + 0] + img0Width;
         float y1 = kpts1[size_t(m.j)*2 + 1];
 
-        // Map score [0..1] to color (B,G,R), e.g., low=red, high=green
         float s = std::max(0.f, std::min(1.f, m.s));
-        cv::Scalar color = cv::Scalar(0, 255*s, 255*(1.0f - s));  // from red to green
+        cv::Scalar color = cv::Scalar(0, 255*s, 255*(1.0f - s));
 
-        // Draw endpoints
         cv::circle(vis, cv::Point2f(x0, y0), 2, color, -1, cv::LINE_AA);
         cv::circle(vis, cv::Point2f(x1, y1), 2, color, -1, cv::LINE_AA);
-
-        // Draw line
         cv::line(vis, cv::Point2f(x0, y0), cv::Point2f(x1, y1), color, 1, cv::LINE_AA);
     }
 }
 
 
-static void toFloatKpts(const std::vector<int64_t>& kptsIntXY, int N, std::vector<float>& kptsFloatXY, int imgWidth, int imgHeight) {
-    kptsFloatXY.resize(size_t(N) * 2);
-    for (int i = 0; i < N; ++i) {
-        float x = static_cast<float>(kptsIntXY[size_t(i)*2 + 0]);
-        float y = static_cast<float>(kptsIntXY[size_t(i)*2 + 1]);
-        // Normalize to [-1, 1] for LightGlue
-        kptsFloatXY[size_t(i)*2 + 0] = (2.0f * x / imgWidth) - 1.0f;
-        kptsFloatXY[size_t(i)*2 + 1] = (2.0f * y / imgHeight) - 1.0f;
-    }
-}
-
-static void sliceDescriptors(const std::vector<float>& descAll, int N, std::vector<float>& descOut) {
-    // descAll is length maxKpts*256; take only first N rows
-    descOut.assign(descAll.begin(), descAll.begin() + size_t(N) * 256);
-}
-
-static inline void l2NormalizeRow(float* row, int D = 256) {
-    double s = 0.0;
-    for (int d = 0; d < D; ++d) s += double(row[d]) * double(row[d]);
-    float inv = 1.0f / std::max(float(std::sqrt(s)), 1e-6f);
-    for (int d = 0; d < D; ++d) row[d] *= inv;
-}
-
-static void l2NormalizeDescriptors(std::vector<float>& desc, int N, int D = 256) {
-    for (int i = 0; i < N; ++i) {
-        l2NormalizeRow(&desc[size_t(i) * D], D);
-    }
-}
-
-static void denormalizeKpts(const std::vector<float>& kptsNormXY, int N, std::vector<float>& kptsPixelXY, int imgWidth, int imgHeight) {
-    kptsPixelXY.resize(size_t(N) * 2);
-    for (int i = 0; i < N; ++i) {
-        float x_norm = kptsNormXY[size_t(i)*2 + 0];
-        float y_norm = kptsNormXY[size_t(i)*2 + 1];
-        kptsPixelXY[size_t(i)*2 + 0] = ((x_norm + 1.0f) * imgWidth) / 2.0f;
-        kptsPixelXY[size_t(i)*2 + 1] = ((y_norm + 1.0f) * imgHeight) / 2.0f;
-    }
-}
-
 int main() {
     try {
-        // Initialize SuperPoint (builds/loads engine once)
         SuperPointTRT sp;
-        sp.setWorkspaceSizeBytes(2ULL << 30);
-        sp.setMaxKeypoints(2048);
-        sp.setScoreThreshold(0.0f); // adjust if desired
-
-        // Use the same resolution you used to build the engine (min=opt=max)
+        LightGlueTRT lg;
+        slam_core::superpoint_lightglue_init(sp, lg);
         const int spH = 376;
         const int spW = 1241;
-        if (!sp.init("superpoint_2048.onnx", "superpoint_2048.engine", spH, spW)) {
-            throw std::runtime_error("SuperPoint init failed");
-        }
-
-        // Read two images (grayscale), preprocess to float32 [0,1]
         cv::Mat img0 = cv::imread("temp3.png", cv::IMREAD_GRAYSCALE);
         cv::Mat img1 = cv::imread("temp4.png", cv::IMREAD_GRAYSCALE);
         if (img0.empty() || img1.empty()) {
             throw std::runtime_error("Failed to load image0.png or image1.png");
         }
-
-        // // Ensure images match engine size (resize if needed)
-        // cv::resize(img0, img0, cv::Size(spW, spH));
-        // cv::resize(img1, img1, cv::Size(spW, spH));
-
-        // Convert to float32 [0,1]
-        cv::Mat img0f, img1f;
-        img0.convertTo(img0f, CV_32F, 1.0/255.0);
-        img1.convertTo(img1f, CV_32F, 1.0/255.0);
-
-        // Run SuperPoint on both images
         SuperPointTRT::Result spRes0, spRes1;
-        if (!sp.runInference(reinterpret_cast<const float*>(img0f.data), img0f.rows, img0f.cols, spRes0)) {
-            throw std::runtime_error("SuperPoint inference failed on image0");
-        }
-        if (!sp.runInference(reinterpret_cast<const float*>(img1f.data), img1f.rows, img1f.cols, spRes1)) {
-            throw std::runtime_error("SuperPoint inference failed on image1");
-        }
-
+        spRes0 = sp.runInference(img0, img0.rows, img0.cols);
+        spRes1 = sp.runInference(img1, img1.rows, img1.cols);
         std::cout << "Image0: valid keypoints = " << spRes0.numValid << std::endl;
         std::cout << "Image1: valid keypoints = " << spRes1.numValid << std::endl;
-
-        // Use actual valid counts (clamp to max if needed)
         const int maxKpts = 2048;
         const int N0 = std::min(spRes0.numValid, maxKpts);
         const int N1 = std::min(spRes1.numValid, maxKpts);
-        if (N0 <= 0 || N1 <= 0) {
-            std::cerr << "No valid keypoints in one or both images; skipping matching." << std::endl;
-            return 0;
-        }
-
-        std::vector<float> kpts0_f, kpts1_f;  // Normalized for LightGlue
-        std::vector<float> desc0_f, desc1_f;
-        toFloatKpts(spRes0.keypoints, N0, kpts0_f, spW, spH);  // Normalizes
-        toFloatKpts(spRes1.keypoints, N1, kpts1_f, spW, spH);  // Normalizes
-        sliceDescriptors(spRes0.descriptors, N0, desc0_f);
-        sliceDescriptors(spRes1.descriptors, N1, desc1_f);
-
-        // // L2-normalize SuperPoint descriptors BEFORE LightGlue
-        // l2NormalizeDescriptors(desc0_f, N0, 256);
-        // l2NormalizeDescriptors(desc1_f, N1, 256);
-
-        // Initialize LightGlue
-        LightGlueTRT lg;
-        if (!lg.init("superpoint_lightglue.onnx", "superpoint_lightglue.engine")) {
-            throw std::runtime_error("LightGlueTRT init failed");
-        }
-
-        // Run LightGlue
+        
         LightGlueTRT::Result lgRes;
-        if (!lg.runInference(kpts0_f, desc0_f, kpts1_f, desc1_f, N0, N1, lgRes)) {
-            throw std::runtime_error("LightGlueTRT inference failed");
-        }
-
-        // Print a summary of matches
+        lgRes = lg.run_Direct_Inference(spRes0, spRes1);
         int nMatches = 0;
         for (int i = 0; i < N0; ++i) {
-            if (lgRes.matches0[i] >= 0 && lgRes.mscores0[i] > 0.7) ++nMatches;
+            if (lgRes.matches0[i] >= 0 && lgRes.mscores0[i] > 0.9) ++nMatches;
         }
         std::cout << "LightGlue matches: " << nMatches << " (of " << N0 << " keypoints in image0)" << std::endl;
 
-        // Print first few matched pairs with scores (now using denormalized pixel coordinates)
-        int printed = 0;
-        for (int i = 0; i < N0 && printed < 10; ++i) {
-            int j = static_cast<int>(lgRes.matches0[i]);
-            if (j >= 0 && j < N1) {
-                float score = lgRes.mscores0[i];
-                // Denormalize for printing
-                float x0_norm = kpts0_f[size_t(i)*2 + 0];
-                float y0_norm = kpts0_f[size_t(i)*2 + 1];
-                float x1_norm = kpts1_f[size_t(j)*2 + 0];
-                float y1_norm = kpts1_f[size_t(j)*2 + 1];
-                float x0 = ((x0_norm + 1.0f) * spW) / 2.0f;
-                float y0 = ((y0_norm + 1.0f) * spH) / 2.0f;
-                float x1 = ((x1_norm + 1.0f) * spW) / 2.0f;
-                float y1 = ((y1_norm + 1.0f) * spH) / 2.0f;
-                std::cout << "i=" << i << " (" << x0 << "," << y0 << ") "
-                          << "<-> j=" << j << " (" << x1 << "," << y1 << ") "
-                          << " score=" << score << std::endl;
-                ++printed;
-            }
-        }
-
-        // Prepare BGR visuals (convert the float grayscale or original grayscale to BGR)
+        // Visualization without normalization/denormalization
         cv::Mat img0_vis, img1_vis;
         cv::cvtColor(img0, img0_vis, cv::COLOR_GRAY2BGR);
         cv::cvtColor(img1, img1_vis, cv::COLOR_GRAY2BGR);
-
-        // Denormalize keypoints for visualization
         std::vector<float> kpts0_vis, kpts1_vis;
-        denormalizeKpts(kpts0_f, N0, kpts0_vis, spW, spH);
-        denormalizeKpts(kpts1_f, N1, kpts1_vis, spW, spH);
-
-        // Draw SuperPoint keypoints used for LightGlue (N0/N1)
-        drawSuperPointKpts(img0_vis, kpts0_vis, N0, cv::Scalar(0, 200, 0), 2, 1);
-        drawSuperPointKpts(img1_vis, kpts1_vis, N1, cv::Scalar(0, 200, 0), 2, 1);
-
-        // Concatenate and draw LightGlue matches (use denormalized for drawing)
+        kpts0_vis.resize(size_t(N0) * 2);
+        kpts1_vis.resize(size_t(N1) * 2);
+        for (int i=0; i < N0; ++i) {
+            kpts0_vis[size_t(i)*2 + 0] = static_cast<float>(spRes0.keypoints[size_t(i)*2 + 0]);
+            kpts0_vis[size_t(i)*2 + 1] = static_cast<float>(spRes0.keypoints[size_t(i)*2 + 1]);
+        }
+        for (int i=0; i < N1; ++i) {
+            kpts1_vis[size_t(i)*2 + 0] = static_cast<float>(spRes1.keypoints[size_t(i)*2 + 0]);
+            kpts1_vis[size_t(i)*2 + 1] = static_cast<float>(spRes1.keypoints[size_t(i)*2 + 1]);
+        }
+        drawSuperPointKpts(img0_vis, kpts0_vis, N0, cv::Scalar(0, 255, 0), 2, 1);
+        drawSuperPointKpts(img1_vis, kpts1_vis, N1, cv::Scalar(0, 255, 0), 2, 1);
         cv::Mat concat = concatHorizontalSameSize(img0_vis, img1_vis);
-        drawLightGlueMatches(concat, img0_vis.cols,
-                            kpts0_vis, kpts1_vis,
-                            lgRes.matches0, lgRes.mscores0,
-                            N0, N1,
-                            /*maxToDraw=*/1000, /*minScore=*/0.0f);
-
-        // Show or save
+        drawLightGlueMatches(concat, img0_vis.cols, kpts0_vis, kpts1_vis, lgRes.matches0, lgRes.mscores0, N0, N1, 1000, 0.99f);
         cv::imshow("SuperPoint+LightGlue Matches", concat);
         cv::imwrite("matches_vis.png", concat);
-
-        // Optionally visualize standalone SuperPoint keypoints per image
-        cv::imshow("SP keypoints - img0", img0_vis);
-        cv::imshow("SP keypoints - img1", img1_vis);
-        cv::imwrite("sp_kpts_img0.png", img0_vis);
-        cv::imwrite("sp_kpts_img1.png", img1_vis);
-
         cv::waitKey(0);
-
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Fatal: " << e.what() << std::endl;

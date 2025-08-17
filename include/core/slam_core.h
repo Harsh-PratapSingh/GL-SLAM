@@ -6,6 +6,8 @@
 #include <opencv2/core/eigen.hpp>
 #include <vector>
 #include <string>
+#include "superpoint.h"
+#include "lightglue.h"
 
 constexpr float SCORE_THRESHOLD = 0.5f;
 constexpr int IMAGE_WIDTH = 1241;
@@ -40,4 +42,8 @@ namespace slam_core {
 
     // void processSlidingWindowBA(const int i, const int window_size, const cv::Mat K, std::vector<cv::Mat> &Rs_est, 
     //                             std::vector<cv::Mat> &Ts_est, std::vector<Point3D> &global_points3D);
+
+
+    void superpoint_lightglue_init(SuperPointTRT& sp, LightGlueTRT& lg);
+                        
 }

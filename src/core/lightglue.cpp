@@ -201,4 +201,99 @@ bool LightGlueTRT::runInference(const std::vector<float>& kpts0, const std::vect
     return ok;
 }
 
+LightGlueTRT::Result LightGlueTRT::run_Direct_Inference(SuperPointTRT::Result& spRes0, SuperPointTRT::Result& spRes1){
+
+    Result out;
+    const int maxKpts = 2048;
+    const int spH = 376;
+    const int spW = 1241;
+    std::vector<float> kpts0, kpts1;
+    std::vector<float> desc0, desc1;
+    const int N0 = std::min(spRes0.numValid, maxKpts);
+    const int N1 = std::min(spRes1.numValid, maxKpts);
+    LightGlueTRT::toFloatKpts(spRes0.keypoints, N0, kpts0, spW, spH);
+    LightGlueTRT::toFloatKpts(spRes1.keypoints, N1, kpts1, spW, spH);
+    LightGlueTRT::sliceDescriptors(spRes0.descriptors, N0, desc0);
+    LightGlueTRT::sliceDescriptors(spRes1.descriptors, N1, desc1);
+
+
+    if (kpts0.size() != static_cast<size_t>(N0 * 2) || kpts1.size() != static_cast<size_t>(N1 * 2) ||
+        desc0.size() != static_cast<size_t>(N0 * 256) || desc1.size() != static_cast<size_t>(N1 * 256)) {
+        return out;
+    }
+
+    if (!setInputShapes(N0, N1)) return out;
+
+    void* d_kpts0 = nullptr; void* d_kpts1 = nullptr; void* d_desc0 = nullptr; void* d_desc1 = nullptr;
+    void* d_matches0 = nullptr; void* d_matches1 = nullptr; void* d_mscores0 = nullptr; void* d_mscores1 = nullptr;
+
+    size_t sz_kpts0 = static_cast<size_t>(N0) * 2 * sizeof(float);
+    size_t sz_kpts1 = static_cast<size_t>(N1) * 2 * sizeof(float);
+    size_t sz_desc0 = static_cast<size_t>(N0) * 256 * sizeof(float);
+    size_t sz_desc1 = static_cast<size_t>(N1) * 256 * sizeof(float);
+    size_t sz_matches0 = static_cast<size_t>(N0) * sizeof(int64_t);
+    size_t sz_matches1 = static_cast<size_t>(N1) * sizeof(int64_t);
+    size_t sz_mscores0 = static_cast<size_t>(N0) * sizeof(float);
+    size_t sz_mscores1 = static_cast<size_t>(N1) * sizeof(float);
+
+    if (!cudaOK(cudaMalloc(&d_kpts0, sz_kpts0)) || !cudaOK(cudaMalloc(&d_kpts1, sz_kpts1)) ||
+        !cudaOK(cudaMalloc(&d_desc0, sz_desc0)) || !cudaOK(cudaMalloc(&d_desc1, sz_desc1)) ||
+        !cudaOK(cudaMalloc(&d_matches0, sz_matches0)) || !cudaOK(cudaMalloc(&d_matches1, sz_matches1)) ||
+        !cudaOK(cudaMalloc(&d_mscores0, sz_mscores0)) || !cudaOK(cudaMalloc(&d_mscores1, sz_mscores1))) {
+        cudaFree(d_kpts0); cudaFree(d_kpts1); cudaFree(d_desc0); cudaFree(d_desc1);
+        cudaFree(d_matches0); cudaFree(d_matches1); cudaFree(d_mscores0); cudaFree(d_mscores1);
+        return out;
+    }
+
+    if (!cudaOK(cudaMemcpy(d_kpts0, kpts0.data(), sz_kpts0, cudaMemcpyHostToDevice)) ||
+        !cudaOK(cudaMemcpy(d_kpts1, kpts1.data(), sz_kpts1, cudaMemcpyHostToDevice)) ||
+        !cudaOK(cudaMemcpy(d_desc0, desc0.data(), sz_desc0, cudaMemcpyHostToDevice)) ||
+        !cudaOK(cudaMemcpy(d_desc1, desc1.data(), sz_desc1, cudaMemcpyHostToDevice))) {
+        cudaFree(d_kpts0); cudaFree(d_kpts1); cudaFree(d_desc0); cudaFree(d_desc1);
+        cudaFree(d_matches0); cudaFree(d_matches1); cudaFree(d_mscores0); cudaFree(d_mscores1);
+        return out;
+    }
+
+    const int nb = engine_->getNbIOTensors();
+    std::vector<void*> bindings(nb, nullptr);
+    bindings[idx_kpts0_] = d_kpts0; bindings[idx_kpts1_] = d_kpts1;
+    bindings[idx_desc0_] = d_desc0; bindings[idx_desc1_] = d_desc1;
+    bindings[idx_matches0_] = d_matches0; bindings[idx_matches1_] = d_matches1;
+    bindings[idx_mscores0_] = d_mscores0; bindings[idx_mscores1_] = d_mscores1;
+
+    if (!context_->executeV2(bindings.data())) {
+        cudaFree(d_kpts0); cudaFree(d_kpts1); cudaFree(d_desc0); cudaFree(d_desc1);
+        cudaFree(d_matches0); cudaFree(d_matches1); cudaFree(d_mscores0); cudaFree(d_mscores1);
+        return out;
+    }
+
+    out.matches0.resize(N0); out.matches1.resize(N1);
+    out.mscores0.resize(N0); out.mscores1.resize(N1);
+
+    bool ok = cudaOK(cudaMemcpy(out.matches0.data(), d_matches0, sz_matches0, cudaMemcpyDeviceToHost)) &&
+              cudaOK(cudaMemcpy(out.matches1.data(), d_matches1, sz_matches1, cudaMemcpyDeviceToHost)) &&
+              cudaOK(cudaMemcpy(out.mscores0.data(), d_mscores0, sz_mscores0, cudaMemcpyDeviceToHost)) &&
+              cudaOK(cudaMemcpy(out.mscores1.data(), d_mscores1, sz_mscores1, cudaMemcpyDeviceToHost));
+
+    cudaFree(d_kpts0); cudaFree(d_kpts1); cudaFree(d_desc0); cudaFree(d_desc1);
+    cudaFree(d_matches0); cudaFree(d_matches1); cudaFree(d_mscores0); cudaFree(d_mscores1);
+
+    return out;
+
+}
+
+void LightGlueTRT::toFloatKpts(const std::vector<int64_t>& kptsIntXY, int N, std::vector<float>& kptsFloatXY, int imgWidth, int imgHeight) {
+    kptsFloatXY.resize(size_t(N) * 2);
+    for (int i = 0; i < N; ++i) {
+        float x = static_cast<float>(kptsIntXY[size_t(i)*2 + 0]);
+        float y = static_cast<float>(kptsIntXY[size_t(i)*2 + 1]);
+        kptsFloatXY[size_t(i)*2 + 0] = (2.0f * x / imgWidth) - 1.0f;
+        kptsFloatXY[size_t(i)*2 + 1] = (2.0f * y / imgHeight) - 1.0f;
+    }
+}
+
+void LightGlueTRT::sliceDescriptors(const std::vector<float>& descAll, int N, std::vector<float>& descOut) {
+    descOut.assign(descAll.begin(), descAll.begin() + size_t(N) * 256);
+}
+
 

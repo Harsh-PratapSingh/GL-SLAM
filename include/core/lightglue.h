@@ -3,6 +3,7 @@
 #include <NvInferRuntime.h>
 #include <NvOnnxParser.h>
 #include <cuda_runtime_api.h>
+#include "superpoint.h"
 
 #include <memory>
 #include <string>
@@ -36,6 +37,8 @@ public:
                       int N0, int N1,
                       Result& out);
 
+    LightGlueTRT::Result run_Direct_Inference(SuperPointTRT::Result& spRes0, SuperPointTRT::Result& spRes1);
+
     // Optional: change workspace cap (default 1GB) before init
     void setWorkspaceSizeBytes(size_t bytes);
 
@@ -55,6 +58,10 @@ private:
     // Helpers
     bool cudaOK(cudaError_t e);
     bool setInputShapes(int N0, int N1);
+
+    static void toFloatKpts(const std::vector<int64_t>& kptsIntXY, int N, std::vector<float>& kptsFloatXY, int imgWidth, int imgHeight);
+    static void sliceDescriptors(const std::vector<float>& descAll, int N, std::vector<float>& descOut);
+
 
 private:
     Logger logger_;
