@@ -174,6 +174,7 @@ int main() {
     // Triangulate
     cv::Mat X4;
     cv::triangulatePoints(P0, P1, inlierPoints0, inlierPoints1, X4);
+    X4.convertTo(X4,CV_64FC1);
 
     // Convert to Nx3 3D points (dehomogenize)
     std::vector<cv::Point3d> points3d;
@@ -181,12 +182,10 @@ int main() {
     points3d.reserve(X4.cols);
     for (int i = 0; i < X4.cols; ++i) {
         double w = X4.at<double>(3, i);
-        if (std::abs(w) < 1e-9) continue;
         double X = X4.at<double>(0, i) / w;
         double Y = X4.at<double>(1, i) / w;
         double Z = X4.at<double>(2, i) / w;
-        if (Z <= 0) continue;  // Skip behind-camera points
-        if (Z > 100) l++;
+        if (std::abs(w) < 1e-9 || Z <= 0 || Z > 100 ) continue;
         points3d.emplace_back(X, Y, Z);
     }
 
