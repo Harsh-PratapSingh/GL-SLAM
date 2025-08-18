@@ -41,7 +41,7 @@ public:
     // The method internally sets input shape [1,1,H,W], allocates device buffers,
     // runs inference, copies outputs, and counts valid keypoints by scoreThreshold_.
     // Returns true on success and fills 'out'.
-    Result runInference(cv::Mat& img, int height, int width);
+    Result runInference(cv::Mat& img1, int height, int width);
 
     
 

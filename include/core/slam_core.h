@@ -22,7 +22,7 @@ namespace slam_core {
     //                                           const cv::Mat& mask,
     //                                           const std::vector<int>& exclude_indices);
 
-    cv::Mat load_calibration(const std::string& path);
+    cv::Mat loadCameraMatrix(const std::string& calibPath);
 
     // std::vector<cv::Mat> load_poses(const std::string& path, int num_poses);
 

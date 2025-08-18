@@ -94,7 +94,8 @@ bool SuperPointTRT::loadEngineFromFile(const std::string& enginePath) {
 }
 
 
-SuperPointTRT::Result SuperPointTRT::runInference(cv::Mat& img, int height, int width) {
+SuperPointTRT::Result SuperPointTRT::runInference(cv::Mat& img1, int height, int width) {
+    cv::Mat img = img1.clone();
     img.convertTo(img, CV_32F, 1.0/255.0);
     const float* imageData = reinterpret_cast<const float*>(img.data);
     Result out;

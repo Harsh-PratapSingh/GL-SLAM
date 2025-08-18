@@ -68,21 +68,26 @@ namespace slam_core {
     //     return points3D;
     // }
 
-    cv::Mat load_calibration(const std::string& path) {
-        std::ifstream file(path);
+    // Function to parse calib.txt and extract camera matrix from P0
+    cv::Mat loadCameraMatrix(const std::string& calibPath) {
+        std::ifstream file(calibPath);
+        if (!file.is_open()) {
+            throw std::runtime_error("Failed to open calib.txt");
+        }
+        
         std::string line;
         while (std::getline(file, line)) {
-            if (line.substr(0, 2) == "P0") {
-                std::istringstream iss(line.substr(4));
-                cv::Mat P0(3, 4, CV_64F);
-                for (int i = 0; i < 12; ++i) iss >> P0.at<double>(i / 4, i % 4);
-                cv::Mat K = P0(cv::Rect(0, 0, 3, 3));
-                std::cout << "Loaded calibration matrix K:\n" << K << "\n";
-                return K;
+            if (line.find("P0:") == 0) {
+                std::istringstream iss(line.substr(3));  // Skip "P0:"
+                cv::Mat P(3, 4, CV_64F);
+                for (int i = 0; i < 12; ++i) {
+                    iss >> P.at<double>(i / 4, i % 4);
+                }
+                // Camera matrix is the first 3x3 of P0
+                return P.colRange(0, 3).clone();
             }
         }
-        std::cerr << "P0 not found\n";
-        exit(-1);
+        throw std::runtime_error("P0 not found in calib.txt");
     }
 
     // std::vector<cv::Mat> load_poses(const std::string& path, int num_poses) {

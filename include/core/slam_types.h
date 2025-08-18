@@ -15,32 +15,57 @@
 struct Observation {
     int keyframe_id;
     cv::Point2f point2D;
+    std::vector<float> descriptor; // 256 floats for this observation's descriptor
 };
 
-// Persistent 3D Map Point
 struct MapPoint {
     int id;
     cv::Point3f position;            // World coordinates
     std::vector<Observation> obs;    // Observations in various keyframes
     bool is_bad = false;
+    // No descriptor here as requested
 };
 
-// Each Image Frame (will become keyframe or be discarded)
 struct Frame {
     int id;
     cv::Mat img;              // Grayscale or RGB
     cv::Mat R;                // 3x3 rotation (world <- camera)
     cv::Mat t;                // 3x1 translation (world <- camera)
     std::vector<cv::KeyPoint> keypoints;
-    cv::Mat descriptors;
-    std::vector<int> map_point_ids; // index into global MapPoints
+    cv::Mat descriptors;      // CV_32F matrix: rows = num keypoints, cols = 256
+    std::vector<float> descriptors_og;
+    std::vector<int> map_point_ids;
     bool is_keyframe = false;
 };
 
-// Tracks both temporary and permanent entities
 struct Map {
-    std::unordered_map<int, MapPoint> map_points; // Permanent landmarks
-    std::unordered_map<int, Frame> keyframes;     // Permanent keyframes
+    std::unordered_map<int, MapPoint> map_points;
+    std::unordered_map<int, Frame> keyframes;
     int next_point_id = 0;
     int next_keyframe_id = 0;
 };
+
+
+//A bad visual slam is quite easy to implement. I give you a rough roadmap:
+
+// Feature extraction for input image
+
+// Match features to previous image(s)
+
+// Compute essential matrix
+
+// Decompose essential matrix into pose
+
+// Triangulate initial point cloud
+
+// Check if initialisation is good (enough inliers)
+
+// Once initialisation is done:
+
+// Use constant velocity model to predict next pose
+
+// Use predicted pose to project existing map points into the camera and check if they match with 2D features nearby
+
+// Use successful 2D/3D correspondences to compute an optimised pose (motion only bundle adjustment)
+
+// Use optimised frame to triangulate new points
