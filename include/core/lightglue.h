@@ -18,6 +18,10 @@ public:
         std::vector<int64_t> matches1;
         std::vector<float> mscores0;
         std::vector<float> mscores1;
+        std::vector<int64_t> keypoints0;   // length = maxKeypoints*2 (x,y) interleaved
+        std::vector<float>   descriptors0; // length = maxKeypoints*256
+        std::vector<int64_t> keypoints1;   // length = maxKeypoints*2 (x,y) interleaved
+        std::vector<float>   descriptors1; // length = maxKeypoints*256
     };
 
     LightGlueTRT();

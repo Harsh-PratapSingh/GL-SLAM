@@ -24,7 +24,7 @@ namespace slam_core {
 
     cv::Mat loadCameraMatrix(const std::string& calibPath);
 
-    // std::vector<cv::Mat> load_poses(const std::string& path, int num_poses);
+    std::vector<cv::Mat> load_poses(const std::string& path);
 
     // void estimate_pose(const std::vector<cv::Point2f>& points1, const std::vector<cv::Point2f>& points2,
     //                   const cv::Mat& K, cv::Mat& R, cv::Mat& T);

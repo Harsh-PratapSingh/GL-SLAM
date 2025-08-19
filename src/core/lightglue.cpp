@@ -211,10 +211,19 @@ LightGlueTRT::Result LightGlueTRT::run_Direct_Inference(SuperPointTRT::Result& s
     std::vector<float> desc0, desc1;
     const int N0 = std::min(spRes0.numValid, maxKpts);
     const int N1 = std::min(spRes1.numValid, maxKpts);
-    LightGlueTRT::toFloatKpts(spRes0.keypoints, N0, kpts0, spW, spH);
-    LightGlueTRT::toFloatKpts(spRes1.keypoints, N1, kpts1, spW, spH);
-    LightGlueTRT::sliceDescriptors(spRes0.descriptors, N0, desc0);
-    LightGlueTRT::sliceDescriptors(spRes1.descriptors, N1, desc1);
+    std::vector<int64_t> keypoints0 = spRes0.keypoints; // length = maxKeypoints*2 (x,y) interleaved
+    std::vector<float>   descriptors0 = spRes0.descriptors; // length = maxKeypoints*256
+    std::vector<int64_t> keypoints1 = spRes1.keypoints;   // length = maxKeypoints*2 (x,y) interleaved
+    std::vector<float>   descriptors1 = spRes1.descriptors; // length = maxKeypoints*256
+    LightGlueTRT::toFloatKpts(keypoints0, N0, kpts0, spW, spH);
+    LightGlueTRT::toFloatKpts(keypoints1, N1, kpts1, spW, spH);
+    LightGlueTRT::sliceDescriptors(descriptors0, N0, desc0);
+    LightGlueTRT::sliceDescriptors(descriptors1, N1, desc1);
+
+    out.keypoints0 = keypoints0;
+    out.keypoints1 = keypoints1;
+    out.descriptors0 = descriptors0;
+    out.descriptors1 = descriptors1;
 
 
     if (kpts0.size() != static_cast<size_t>(N0 * 2) || kpts1.size() != static_cast<size_t>(N1 * 2) ||

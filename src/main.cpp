@@ -96,10 +96,10 @@ int main() {
         int match_idx = lgRes.matches0[i];
         if (match_idx >= 0 && lgRes.mscores0[i] > 0.7) {
             // Assuming keypoints are interleaved x,y as int64_t; cast to float
-            float x0 = static_cast<float>(spRes0.keypoints[2 * i]);
-            float y0 = static_cast<float>(spRes0.keypoints[2 * i + 1]);
-            float x1 = static_cast<float>(spRes1.keypoints[2 * match_idx]);
-            float y1 = static_cast<float>(spRes1.keypoints[2 * match_idx + 1]);
+            float x0 = static_cast<float>(lgRes.keypoints0[2 * i]);
+            float y0 = static_cast<float>(lgRes.keypoints0[2 * i + 1]);
+            float x1 = static_cast<float>(lgRes.keypoints1[2 * match_idx]);
+            float y1 = static_cast<float>(lgRes.keypoints1[2 * match_idx + 1]);
             points0.push_back(cv::Point2f(x0, y0));
             points1.push_back(cv::Point2f(x1, y1));
         }
@@ -130,33 +130,37 @@ int main() {
     // R = R.t();
     // t = -R * t;
 
-    // Scale translation to GT magnitude
-    t *= (t_gt_mag / cv::norm(t));
     
-    std::cout << "Recovered " << inliers << " inliers for pose estimation." << std::endl;
-    std::cout << "Relative Rotation (R):\n" << R << std::endl;
-    std::cout << "Relative Translation (t):\n" << t << std::endl;
-
-    // Compare with GT
-    double rot_err_deg = rotationAngleErrorDeg(R, R_gt);
-    double t_dir_err_deg = angleBetweenVectorsDeg(t, t_gt);
-    double t_mag_err = std::abs(cv::norm(t) - t_gt_mag);
-
-    std::cout << "GT |t|: " << t_gt_mag << " m\n";
-    std::cout << "Est |t| (scaled): " << cv::norm(t) << " m\n";
-    std::cout << "Rotation error: " << rot_err_deg << " deg\n";
-    std::cout << "Translation direction error: " << t_dir_err_deg << " deg\n";
-    std::cout << "Translation magnitude error: " << t_mag_err << " m\n";
+    
+    
 
     // --- Visualization of Inlier Matches ---
 
     
     // Extract inliers immediately (using mask)
     std::vector<cv::Point2f> inlierPoints0, inlierPoints1;
+    std::vector<std::vector<float>> inlierDescriptors0, inlierDescriptors1;
     for (size_t i = 0; i < points0.size(); ++i) {
         if (mask.at<unsigned char>(i) > 0) {
             inlierPoints0.push_back(points0[i]);
             inlierPoints1.push_back(points1[i]);
+
+            //.
+            // descriptors for img0
+            std::vector<float> desc0(256);
+            for (int d = 0; d < 256; ++d)
+                desc0[d] = lgRes.descriptors0[i * 256 + d];
+            inlierDescriptors0.push_back(desc0);
+
+            // descriptors for img1
+            int match_idx = -1;
+            // Find index of match in spRes1 based on your matching logic (if available)
+            // If points1 populated by lgRes.matches0[i], then match_idx = lgRes.matches0[i];
+            match_idx = lgRes.matches0[i];
+            std::vector<float> desc1(256);
+            for (int d = 0; d < 256; ++d)
+                desc1[d] = lgRes.descriptors1[match_idx * 256 + d];
+            inlierDescriptors1.push_back(desc1);
         }
     }
     std::cout << "Extracted " << inlierPoints1.size() << " inlier points on second image." << std::endl;
@@ -182,6 +186,8 @@ int main() {
     std::vector<cv::Point2f> P_1 = inlierPoints1;
     inlierPoints0.clear();
     inlierPoints1.clear();
+    std::vector<cv::Point2f> filteredInlierPoints0, filteredInlierPoints1;
+    std::vector<std::vector<float>> filteredDescriptors0, filteredDescriptors1;
     points3d.reserve(X4.cols);
     for (int i = 0; i < X4.cols; ++i) {
         double w = X4.at<double>(3, i);
@@ -190,8 +196,10 @@ int main() {
         double Z = X4.at<double>(2, i) / w;
         if (std::abs(w) < 1e-9 || Z <= 0 || Z > 100 ) continue;
         points3d.emplace_back(X, Y, Z);
-        inlierPoints0.push_back(P_0[i]);
-        inlierPoints1.push_back(P_1[i]);
+        filteredInlierPoints0.push_back(inlierPoints0[i]);
+        filteredInlierPoints1.push_back(inlierPoints1[i]);
+        filteredDescriptors0.push_back(inlierDescriptors0[i]);
+        filteredDescriptors1.push_back(inlierDescriptors1[i]);
     }
 
     std::cout << "Triangulated " << points3d.size() << " 3D points." << std::endl;
@@ -205,6 +213,10 @@ int main() {
     frame1.img = img1;
     frame0.R = cv::Mat::eye(3,3,CV_64F);
     frame0.t = cv::Mat::zeros(3,1,CV_64F);
+    R = R.t(); //changed T 4x4 to camera 1 to camera 2
+    t = -R * t;
+    // Scale translation to GT magnitude
+    t *= (t_gt_mag / cv::norm(t));
     frame1.R = R.clone();
     frame1.t = t.clone();
     frame0.keypoints = spRes0.keypoints;
@@ -214,42 +226,60 @@ int main() {
     frame0.is_keyframe = true;
     frame1.is_keyframe = true;
 
+    //DEBUG
+
+    std::cout << "SIZES:  " << filteredInlierPoints1.size() << "  -  " << filteredDescriptors1.size() << std::endl;
+    std::cout << "Recovered " << inliers << " inliers for pose estimation." << std::endl;
+    std::cout << "Relative Rotation (R):\n" << R << std::endl;
+    std::cout << "Relative Translation (t):\n" << t << std::endl;
+
+    // Compare with GT
+    double rot_err_deg = rotationAngleErrorDeg(R, R_gt);
+    double t_dir_err_deg = angleBetweenVectorsDeg(t, t_gt);
+    double t_mag_err = std::abs(cv::norm(t) - t_gt_mag);
+
+    std::cout << "GT |t|: " << t_gt_mag << " m\n";
+    std::cout << "Est |t| (scaled): " << cv::norm(t) << " m\n";
+    std::cout << "Rotation error: " << rot_err_deg << " deg\n";
+    std::cout << "Translation direction error: " << t_dir_err_deg << " deg\n";
+    std::cout << "Translation magnitude error: " << t_mag_err << " m\n";
+
     // --- Associate triangulated points with MapPoints and Observations ---
-    for (size_t i = 0; i < points3d.size(); ++i) {
-        MapPoint mp;
-        mp.id = map.next_point_id++;
-        mp.position = cv::Point3f(points3d[i].x, points3d[i].y, points3d[i].z);
+    // for (size_t i = 0; i < points3d.size(); ++i) {
+    //     MapPoint mp;
+    //     mp.id = map.next_point_id++;
+    //     mp.position = cv::Point3f(points3d[i].x, points3d[i].y, points3d[i].z);
 
-        // Observations: two per map point, one from each frame
-        Observation obs0, obs1;
-        obs0.keyframe_id = frame0.id;
-        obs0.point2D = inlierPoints0[i];
+    //     // Observations: two per map point, one from each frame
+    //     Observation obs0, obs1;
+    //     obs0.keyframe_id = frame0.id;
+    //     obs0.point2D = inlierPoints0[i];
 
-        // Copy descriptor for frame0 (use your method for extracting correct descriptor idx)
-        obs0.descriptor.resize(256);
-        for (int d = 0; d < 256; ++d)
-            obs0.descriptor[d] = frame0.descriptors[i*256 +d];
+    //     // Copy descriptor for frame0 (use your method for extracting correct descriptor idx)
+    //     obs0.descriptor.resize(256);
+    //     for (int d = 0; d < 256; ++d)
+    //         obs0.descriptor[d] = frame0.descriptors[i*256 +d];
 
-        obs1.keyframe_id = frame1.id;
-        obs1.point2D = inlierPoints1[i];
-        obs1.descriptor.resize(256);
-        for (int d = 0; d < 256; ++d)
-            obs1.descriptor[d] = frame1.descriptors[i*256 +d];;
+    //     obs1.keyframe_id = frame1.id;
+    //     obs1.point2D = inlierPoints1[i];
+    //     obs1.descriptor.resize(256);
+    //     for (int d = 0; d < 256; ++d)
+    //         obs1.descriptor[d] = frame1.descriptors[i*256 +d];;
 
-        mp.obs.push_back(obs0);
-        mp.obs.push_back(obs1);
+    //     mp.obs.push_back(obs0);
+    //     mp.obs.push_back(obs1);
 
-        map.map_points[mp.id] = mp;
-        map.keyframes[frame0.id].map_point_ids.push_back(mp.id);
-        map.keyframes[frame1.id].map_point_ids.push_back(mp.id);
-    }
-    std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
-            << map.keyframes.size() << " KeyFrames." << std::endl;
+    //     map.map_points[mp.id] = mp;
+    //     map.keyframes[frame0.id].map_point_ids.push_back(mp.id);
+    //     map.keyframes[frame1.id].map_point_ids.push_back(mp.id);
+    // }
+    // std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
+    //         << map.keyframes.size() << " KeyFrames." << std::endl;
     
     // Visualize inliers on the second image
     cv::Mat img1_color;
     cv::cvtColor(img1, img1_color, cv::COLOR_GRAY2BGR);
-    for (const auto& pt : inlierPoints1) {
+    for (const auto& pt : filteredInlierPoints1) {
         cv::circle(img1_color, pt, 1, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
     }
     cv::imshow("Inliers on Second Image", img1_color);

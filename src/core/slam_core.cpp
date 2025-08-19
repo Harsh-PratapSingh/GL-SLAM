@@ -90,22 +90,24 @@ namespace slam_core {
         throw std::runtime_error("P0 not found in calib.txt");
     }
 
-    // std::vector<cv::Mat> load_poses(const std::string& path, int num_poses) {
-    //     std::ifstream file(path);
-    //     std::vector<cv::Mat> poses;
-    //     std::string line;
-    //     for (int i = 0; i < num_poses && std::getline(file, line); ++i) {
-    //         std::istringstream iss(line);
-    //         cv::Mat pose(3, 4, CV_64F);
-    //         for (int j = 0; j < 12; ++j) iss >> pose.at<double>(j / 4, j % 4);
-    //         poses.push_back(pose);
-    //     }
-    //     if (poses.size() < num_poses) {
-    //         std::cerr << "Failed to load " << num_poses << " poses\n";
-    //         exit(-1);
-    //     }
-    //     return poses;
-    // }
+    std::vector<cv::Mat> load_poses(const std::string& path) {
+        std::ifstream f(path);
+        if (!f.is_open()) throw std::runtime_error("Failed to open poses file");
+        std::vector<cv::Mat> poses;
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            std::istringstream iss(line);
+            cv::Mat T = cv::Mat::eye(4, 4, CV_64F);
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    iss >> T.at<double>(r, c);
+                }
+            }
+            poses.push_back(T);
+        }
+        return poses;
+    }
 
     // void estimate_pose(const std::vector<cv::Point2f>& points1, const std::vector<cv::Point2f>& points2,
     //                   const cv::Mat& K, cv::Mat& R, cv::Mat& T) {
