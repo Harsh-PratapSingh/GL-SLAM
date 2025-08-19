@@ -31,9 +31,9 @@ struct Frame {
     cv::Mat img;              // Grayscale or RGB
     cv::Mat R;                // 3x3 rotation (world <- camera)
     cv::Mat t;                // 3x1 translation (world <- camera)
-    std::vector<cv::KeyPoint> keypoints;
-    cv::Mat descriptors;      // CV_32F matrix: rows = num keypoints, cols = 256
-    std::vector<float> descriptors_og;
+    std::vector<int64_t> keypoints;
+    // cv::Mat descriptors;      // CV_32F matrix: rows = num keypoints, cols = 256
+    std::vector<float> descriptors;
     std::vector<int> map_point_ids;
     bool is_keyframe = false;
 };
