@@ -116,7 +116,6 @@ int main() {
     cv::Mat R_gt = T_w1(cv::Rect(0,0,3,3)).clone();
     cv::Mat t_gt = T_w1(cv::Rect(3,0,1,3)).clone();
 
-    std::cout << "Pose : " << T_w1 << std::endl;
     double t_gt_mag = cv::norm(t_gt);
     
     
@@ -245,36 +244,29 @@ int main() {
     std::cout << "Translation magnitude error: " << t_mag_err << " m\n";
 
     // --- Associate triangulated points with MapPoints and Observations ---
-    // for (size_t i = 0; i < points3d.size(); ++i) {
-    //     MapPoint mp;
-    //     mp.id = map.next_point_id++;
-    //     mp.position = cv::Point3f(points3d[i].x, points3d[i].y, points3d[i].z);
+    for (size_t i = 0; i < points3d.size(); ++i) {
+        MapPoint mp;
+        mp.id = map.next_point_id++;
+        mp.position = cv::Point3f(points3d[i].x, points3d[i].y, points3d[i].z);
 
-    //     // Observations: two per map point, one from each frame
-    //     Observation obs0, obs1;
-    //     obs0.keyframe_id = frame0.id;
-    //     obs0.point2D = inlierPoints0[i];
+        Observation obs0, obs1;
+        obs0.keyframe_id = frame0.id;
+        obs0.point2D = filteredInlierPoints0[i];
+        obs0.descriptor = filteredDescriptors0[i];
 
-    //     // Copy descriptor for frame0 (use your method for extracting correct descriptor idx)
-    //     obs0.descriptor.resize(256);
-    //     for (int d = 0; d < 256; ++d)
-    //         obs0.descriptor[d] = frame0.descriptors[i*256 +d];
+        obs1.keyframe_id = frame1.id;
+        obs1.point2D = filteredInlierPoints1[i];
+        obs1.descriptor = filteredDescriptors1[i];
 
-    //     obs1.keyframe_id = frame1.id;
-    //     obs1.point2D = inlierPoints1[i];
-    //     obs1.descriptor.resize(256);
-    //     for (int d = 0; d < 256; ++d)
-    //         obs1.descriptor[d] = frame1.descriptors[i*256 +d];;
+        mp.obs.push_back(obs0);
+        mp.obs.push_back(obs1);
 
-    //     mp.obs.push_back(obs0);
-    //     mp.obs.push_back(obs1);
-
-    //     map.map_points[mp.id] = mp;
-    //     map.keyframes[frame0.id].map_point_ids.push_back(mp.id);
-    //     map.keyframes[frame1.id].map_point_ids.push_back(mp.id);
-    // }
-    // std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
-    //         << map.keyframes.size() << " KeyFrames." << std::endl;
+        map.map_points[mp.id] = mp;
+        map.keyframes[frame0.id].map_point_ids.push_back(mp.id);
+        map.keyframes[frame1.id].map_point_ids.push_back(mp.id);
+    }
+    std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
+            << map.keyframes.size() << " KeyFrames." << std::endl;
     
     // Visualize inliers on the second image
     cv::Mat img1_color;
