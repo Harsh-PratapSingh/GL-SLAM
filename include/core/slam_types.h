@@ -15,7 +15,9 @@
 struct Observation {
     int keyframe_id;
     cv::Point2f point2D;
-    std::vector<float> descriptor; // 256 floats for this observation's descriptor
+    int kp_index; //NEW
+    // const Frame& kf = map.keyframes[obs.keyframe_id];
+    // const float* desc = &kf.descriptors[obs.kp_index*256]; // For when to acces descriptors later
 };
 
 struct MapPoint {
@@ -35,6 +37,7 @@ struct Frame {
     // cv::Mat descriptors;      // CV_32F matrix: rows = num keypoints, cols = 256
     std::vector<float> descriptors;
     std::vector<int> map_point_ids;
+    std::vector<int> kp_to_mpid;    // NEW: size N, filled after mapping
     bool is_keyframe = false;
 };
 

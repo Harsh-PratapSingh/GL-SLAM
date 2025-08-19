@@ -92,6 +92,7 @@ int main() {
 
     // Extract matched keypoints
     std::vector<cv::Point2f> points0, points1;
+    std::vector<int> origIdx0, origIdx1; // NEW: original SP indices per kept match
     for (int i = 0; i < spRes0.numValid; ++i) {
         int match_idx = lgRes.matches0[i];
         if (match_idx >= 0 && lgRes.mscores0[i] > 0.7) {
@@ -102,6 +103,8 @@ int main() {
             float y1 = static_cast<float>(lgRes.keypoints1[2 * match_idx + 1]);
             points0.push_back(cv::Point2f(x0, y0));
             points1.push_back(cv::Point2f(x1, y1));
+            origIdx0.emplace_back(i);           // original index in spRes0
+            origIdx1.emplace_back(match_idx);   // original index in spRes1
         }
     }
     
@@ -130,36 +133,19 @@ int main() {
     // t = -R * t;
 
     
-    
-    
 
     // --- Visualization of Inlier Matches ---
 
     
     // Extract inliers immediately (using mask)
     std::vector<cv::Point2f> inlierPoints0, inlierPoints1;
-    std::vector<std::vector<float>> inlierDescriptors0, inlierDescriptors1;
+    std::vector<int> inlierOrigIdx0, inlierOrigIdx1; // NEW
     for (size_t i = 0; i < points0.size(); ++i) {
         if (mask.at<unsigned char>(i) > 0) {
             inlierPoints0.push_back(points0[i]);
             inlierPoints1.push_back(points1[i]);
-
-            //.
-            // descriptors for img0
-            std::vector<float> desc0(256);
-            for (int d = 0; d < 256; ++d)
-                desc0[d] = lgRes.descriptors0[i * 256 + d];
-            inlierDescriptors0.push_back(desc0);
-
-            // descriptors for img1
-            int match_idx = -1;
-            // Find index of match in spRes1 based on your matching logic (if available)
-            // If points1 populated by lgRes.matches0[i], then match_idx = lgRes.matches0[i];
-            match_idx = lgRes.matches0[i];
-            std::vector<float> desc1(256);
-            for (int d = 0; d < 256; ++d)
-                desc1[d] = lgRes.descriptors1[match_idx * 256 + d];
-            inlierDescriptors1.push_back(desc1);
+            inlierOrigIdx0.push_back(origIdx0[i]);
+            inlierOrigIdx1.push_back(origIdx1[i]);
         }
     }
     std::cout << "Extracted " << inlierPoints1.size() << " inlier points on second image." << std::endl;
@@ -181,12 +167,8 @@ int main() {
 
     // Convert to Nx3 3D points (dehomogenize)
     std::vector<cv::Point3d> points3d;
-    std::vector<cv::Point2f> P_0 = inlierPoints0;
-    std::vector<cv::Point2f> P_1 = inlierPoints1;
-    inlierPoints0.clear();
-    inlierPoints1.clear();
-    std::vector<cv::Point2f> filteredInlierPoints0, filteredInlierPoints1;
-    std::vector<std::vector<float>> filteredDescriptors0, filteredDescriptors1;
+
+    std::vector<int> filteredOrigIdx0, filteredOrigIdx1;
     points3d.reserve(X4.cols);
     for (int i = 0; i < X4.cols; ++i) {
         double w = X4.at<double>(3, i);
@@ -195,10 +177,10 @@ int main() {
         double Z = X4.at<double>(2, i) / w;
         if (std::abs(w) < 1e-9 || Z <= 0 || Z > 100 ) continue;
         points3d.emplace_back(X, Y, Z);
-        filteredInlierPoints0.push_back(inlierPoints0[i]);
-        filteredInlierPoints1.push_back(inlierPoints1[i]);
-        filteredDescriptors0.push_back(inlierDescriptors0[i]);
-        filteredDescriptors1.push_back(inlierDescriptors1[i]);
+
+
+        filteredOrigIdx0.push_back(inlierOrigIdx0[i]);
+        filteredOrigIdx1.push_back(inlierOrigIdx1[i]);
     }
 
     std::cout << "Triangulated " << points3d.size() << " 3D points." << std::endl;
@@ -221,13 +203,16 @@ int main() {
     frame0.keypoints = spRes0.keypoints;
     frame1.keypoints = spRes1.keypoints;
     frame0.descriptors = spRes0.descriptors;
-    frame0.descriptors = spRes0.descriptors;
+    frame1.descriptors = spRes1.descriptors;
     frame0.is_keyframe = true;
     frame1.is_keyframe = true;
+    map.keyframes[frame0.id] = frame0;
+    map.keyframes[frame1.id] = frame1;
+    
 
     //DEBUG
 
-    std::cout << "SIZES:  " << filteredInlierPoints1.size() << "  -  " << filteredDescriptors1.size() << std::endl;
+    //std::cout << "SIZES:  " << filteredInlierPoints1.size() << "  -  " << filteredDescriptors1.size() << std::endl;
     std::cout << "Recovered " << inliers << " inliers for pose estimation." << std::endl;
     std::cout << "Relative Rotation (R):\n" << R << std::endl;
     std::cout << "Relative Translation (t):\n" << t << std::endl;
@@ -244,6 +229,10 @@ int main() {
     std::cout << "Translation magnitude error: " << t_mag_err << " m\n";
 
     // --- Associate triangulated points with MapPoints and Observations ---
+
+    map.keyframes[frame0.id].kp_to_mpid.assign(map.keyframes[frame0.id].keypoints.size()/2, -1);
+    map.keyframes[frame1.id].kp_to_mpid.assign(map.keyframes[frame1.id].keypoints.size()/2, -1);
+    
     for (size_t i = 0; i < points3d.size(); ++i) {
         MapPoint mp;
         mp.id = map.next_point_id++;
@@ -251,12 +240,18 @@ int main() {
 
         Observation obs0, obs1;
         obs0.keyframe_id = frame0.id;
-        obs0.point2D = filteredInlierPoints0[i];
-        obs0.descriptor = filteredDescriptors0[i];
+        obs0.kp_index = filteredOrigIdx0[i]; // NEW: original SP index for frame0
+        float x0 = (float)map.keyframes[frame0.id].keypoints[2*obs0.kp_index];
+        float y0 = (float)map.keyframes[frame0.id].keypoints[2*obs0.kp_index+1];
+
+        map.keyframes[frame0.id].kp_to_mpid[obs0.kp_index] = mp.id; 
 
         obs1.keyframe_id = frame1.id;
-        obs1.point2D = filteredInlierPoints1[i];
-        obs1.descriptor = filteredDescriptors1[i];
+        obs1.kp_index = filteredOrigIdx1[i]; // NEW: original SP index for frame1
+        x0 = (float)map.keyframes[frame1.id].keypoints[2*obs1.kp_index];
+        y0 = (float)map.keyframes[frame1.id].keypoints[2*obs1.kp_index+1];
+       
+        map.keyframes[frame1.id].kp_to_mpid[obs1.kp_index] = mp.id; 
 
         mp.obs.push_back(obs0);
         mp.obs.push_back(obs1);
@@ -267,12 +262,46 @@ int main() {
     }
     std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
             << map.keyframes.size() << " KeyFrames." << std::endl;
-    
+
+            
+    // cv::Mat img2 = cv::imread("temp5.png", cv::IMREAD_GRAYSCALE);
+    // if (img2.empty()) {
+    //     throw std::runtime_error("Failed to load temp5.png");
+    // }
+
+
+    // // 1) Run SuperPoint on temp5.png
+    // SuperPointTRT::Result spRes2 = sp.runInference(img2, img2.rows, img2.cols);
+    // std::cout << "Image2: valid keypoints = " << spRes2.numValid << std::endl;
+
+    // lgRes = lg.run_Direct_Inference(spRes1, spRes2);
+
+    // // Extract matched keypoints
+    // points0.clear();
+    // points1.clear();
+    // for (int i = 0; i < spRes1.numValid; ++i) {
+    //     int match_idx = lgRes.matches0[i];
+    //     if (match_idx >= 0 && lgRes.mscores0[i] > 0.7) {
+    //         // Assuming keypoints are interleaved x,y as int64_t; cast to float
+    //         float x0 = static_cast<float>(lgRes.keypoints0[2 * i]);
+    //         float y0 = static_cast<float>(lgRes.keypoints0[2 * i + 1]);
+    //         float x1 = static_cast<float>(lgRes.keypoints1[2 * match_idx]);
+    //         float y1 = static_cast<float>(lgRes.keypoints1[2 * match_idx + 1]);
+    //         points0.push_back(cv::Point2f(x0, y0));
+    //         points1.push_back(cv::Point2f(x1, y1));
+            
+    //     }
+    // }
+
+
+
     // Visualize inliers on the second image
     cv::Mat img1_color;
     cv::cvtColor(img1, img1_color, cv::COLOR_GRAY2BGR);
-    for (const auto& pt : filteredInlierPoints1) {
-        cv::circle(img1_color, pt, 1, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
+    for (const auto& pt : filteredOrigIdx1) {
+            float x = static_cast<float>(map.keyframes[1].keypoints[2 * pt]);
+            float y = static_cast<float>(map.keyframes[1].keypoints[2 * pt + 1]);
+        cv::circle(img1_color, cv::Point2f(x, y), 1, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
     }
     cv::imshow("Inliers on Second Image", img1_color);
     cv::waitKey(0);

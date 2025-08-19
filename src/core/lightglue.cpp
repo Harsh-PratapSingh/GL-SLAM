@@ -204,6 +204,11 @@ bool LightGlueTRT::runInference(const std::vector<float>& kpts0, const std::vect
 LightGlueTRT::Result LightGlueTRT::run_Direct_Inference(SuperPointTRT::Result& spRes0, SuperPointTRT::Result& spRes1){
 
     Result out;
+
+    out.keypoints0 = spRes0.keypoints;
+    out.keypoints1 = spRes1.keypoints;
+    out.descriptors0 = spRes0.descriptors;
+    out.descriptors1 = spRes1.descriptors;
     const int maxKpts = 2048;
     const int spH = 376;
     const int spW = 1241;
@@ -220,10 +225,7 @@ LightGlueTRT::Result LightGlueTRT::run_Direct_Inference(SuperPointTRT::Result& s
     LightGlueTRT::sliceDescriptors(descriptors0, N0, desc0);
     LightGlueTRT::sliceDescriptors(descriptors1, N1, desc1);
 
-    out.keypoints0 = keypoints0;
-    out.keypoints1 = keypoints1;
-    out.descriptors0 = descriptors0;
-    out.descriptors1 = descriptors1;
+    
 
 
     if (kpts0.size() != static_cast<size_t>(N0 * 2) || kpts1.size() != static_cast<size_t>(N1 * 2) ||
