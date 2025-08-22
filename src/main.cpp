@@ -140,6 +140,15 @@ int main() {
     }
     std::cout << "Extracted " << inliersPairs.size() << " inlier matches." << std::endl;
 
+    // R = R.t();
+    // t = -R * t;
+    // Scale translation to GT magnitude (compare against T_w1)
+    cv::Mat T_w1 = gtPoses[1];
+    cv::Mat t_gt = T_w1(cv::Rect(3,0,1,3)).clone();
+    cv::Mat R_gt = T_w1(cv::Rect(0,0,3,3)).clone();
+    double t_gt_mag = cv::norm(t_gt);
+    t *= (t_gt_mag / cv::norm(t));
+
     // Projection matrices: P0 = K [I|0], P1 = K [R|t]
     cv::Mat I = cv::Mat::eye(3, 3, CV_64F);
     cv::Mat Rt(3, 4, CV_64F), P0(3, 4, CV_64F), P1(3, 4, CV_64F);
@@ -200,10 +209,11 @@ int main() {
     R = R.t();
     t = -R * t;
     // Scale translation to GT magnitude (compare against T_w1)
-    cv::Mat T_w1 = gtPoses[1];
-    cv::Mat t_gt = T_w1(cv::Rect(3,0,1,3)).clone();
-    double t_gt_mag = cv::norm(t_gt);
-    t *= (t_gt_mag / cv::norm(t));
+    // cv::Mat T_w1 = gtPoses[1];
+    // cv::Mat t_gt = T_w1(cv::Rect(3,0,1,3)).clone();
+    // cv::Mat R_gt = T_w1(cv::Rect(0,0,3,3)).clone();
+    // double t_gt_mag = cv::norm(t_gt);
+    // t *= (t_gt_mag / cv::norm(t));
 
     frame1.R = R.clone();
     frame1.t = t.clone();
@@ -224,7 +234,7 @@ int main() {
     std::cout << "Relative Translation (t):\n" << t << std::endl;
 
     // Compare with GT
-    cv::Mat R_gt = T_w1(cv::Rect(0,0,3,3)).clone();
+    
     double rot_err_deg = rotationAngleErrorDeg(R, R_gt);
     double t_dir_err_deg = angleBetweenVectorsDeg(t, t_gt);
     double t_mag_err = std::abs(cv::norm(t) - t_gt_mag);
@@ -376,7 +386,7 @@ int main() {
     cv::Mat T_w2 = gtPoses[2];
     cv::Mat t_gt2 = T_w2(cv::Rect(3,0,1,3)).clone();
     double t_gt_mag2 = cv::norm(t_gt2);
-    t2 *= (t_gt_mag2 / cv::norm(t2));
+    // t2 *= (t_gt_mag2 / cv::norm(t2));
 
     frame2.R = R2.clone();
     frame2.t = t2.clone();
