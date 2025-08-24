@@ -22,9 +22,10 @@ namespace slam_core {
     //                                           const cv::Mat& mask,
     //                                           const std::vector<int>& exclude_indices);
 
-    cv::Mat loadCameraMatrix(const std::string& calibPath);
+    cv::Mat load_camera_matrix(const std::string& calibPath);
 
     std::vector<cv::Mat> load_poses(const std::string& path);
+
 
     // void estimate_pose(const std::vector<cv::Point2f>& points1, const std::vector<cv::Point2f>& points2,
     //                   const cv::Mat& K, cv::Mat& R, cv::Mat& T);
@@ -46,4 +47,16 @@ namespace slam_core {
 
     void superpoint_lightglue_init(SuperPointTRT& sp, LightGlueTRT& lg);
                         
+    std::vector<Match2D2D> lightglue_score_filter(LightGlueTRT::Result& result, const float& score);
+    
+    std::tuple<cv::Mat, cv::Mat, cv::Mat> pose_estimator(std::vector<Match2D2D>& matches, cv::Mat& K);
+
+    std::vector<Match2D2D> pose_estimator_mask_filter(std::vector<Match2D2D>& matches, cv::Mat mask);
+
+    cv::Mat adjust_translation_magnitude(std::vector<cv::Mat>& gtPoses, cv::Mat& t, int frame);
+
+    std::tuple<std::vector<cv::Point3d>, std::vector<Match2D2D>> triangulate_and_filter_3d_points(
+        cv::Mat& R1, cv::Mat& t1, cv::Mat& R2, cv::Mat& t2, cv::Mat& K, std::vector<Match2D2D> matches,
+        const float& distance_threshold, const float& reprojection_threshold);
+
 }

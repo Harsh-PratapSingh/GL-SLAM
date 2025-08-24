@@ -69,7 +69,7 @@ namespace slam_core {
     // }
 
     // Function to parse calib.txt and extract camera matrix from P0
-    cv::Mat loadCameraMatrix(const std::string& calibPath) {
+    cv::Mat load_camera_matrix(const std::string& calibPath) {
         std::ifstream file(calibPath);
         if (!file.is_open()) {
             throw std::runtime_error("Failed to open calib.txt");
@@ -425,6 +425,7 @@ namespace slam_core {
 
 
     void superpoint_lightglue_init(SuperPointTRT& sp, LightGlueTRT& lg){
+
         sp.setWorkspaceSizeBytes(2ULL << 30);
         sp.setMaxKeypoints(2048);
         sp.setScoreThreshold(0.0f);
@@ -438,5 +439,150 @@ namespace slam_core {
         }
     }
 
+    std::vector<Match2D2D> lightglue_score_filter(LightGlueTRT::Result& result, const float& score){
+ 
+        std::vector<Match2D2D> matches;
+        uint16_t lg_matches = result.matches0.size();
+        matches.reserve(lg_matches);
+
+        for (int i = 0; i < lg_matches; ++i) {
+            int j = result.matches0[i];
+            if (j >= 0 && result.mscores0[i] > score) {
+                matches.push_back({
+                    i, j,
+                    cv::Point2d((double)result.keypoints0[2*i],     (double)result.keypoints0[2*i + 1]),
+                    cv::Point2d((double)result.keypoints1[2*j],     (double)result.keypoints1[2*j + 1])
+                });
+            }
+        }
+
+        matches.shrink_to_fit();
+        std::cout << "Matches(Score = " << score << " ):" << matches.size() << " out of " << lg_matches << std::endl;
+
+        return matches;
+    }
+
+    std::tuple<cv::Mat, cv::Mat, cv::Mat> pose_estimator(std::vector<Match2D2D>& matches, cv::Mat& K){
+        
+        std::vector<cv::Point2d> points0, points1;
+        points0.reserve(matches.size());
+        points1.reserve(matches.size());
+        for (const auto& m : matches) {
+            points0.push_back(m.p0);
+            points1.push_back(m.p1);
+        }
+
+        cv::Mat essentialMat, mask, R, t;
+        essentialMat = cv::findEssentialMat(points0, points1, K, cv::USAC_MAGSAC, 0.999, 1.0, mask);
+        int inliers = cv::recoverPose(essentialMat, points0, points1, K, R, t, mask);
+
+        return std::make_tuple(R, t, mask);
+    }
+
+    std::vector<Match2D2D> pose_estimator_mask_filter(std::vector<Match2D2D>& matches, cv::Mat mask){
+
+        std::vector<Match2D2D> inliersPairs;
+        inliersPairs.reserve(matches.size());
+        const uchar* mptr = mask.ptr<uchar>();
+        for (size_t k = 0; k < matches.size(); ++k) {
+            if (mptr[k]) inliersPairs.push_back(matches[k]);
+        }
+        std::cout << "Extracted " << inliersPairs.size() << " inlier matches." << std::endl;
+
+        return inliersPairs;
+    }
+
+    cv::Mat adjust_translation_magnitude(std::vector<cv::Mat>& gtPoses, cv::Mat& t, int frame){
+        
+        double t_gt_mag = cv::norm(gtPoses[frame](cv::Rect(3,0,1,3)));
+        cv::Mat T = t*(t_gt_mag / cv::norm(t));
+        return T;
+
+    }
+
+    std::tuple<std::vector<cv::Point3d>, std::vector<Match2D2D>> triangulate_and_filter_3d_points(
+        cv::Mat& R1, cv::Mat& t1, cv::Mat& R2, cv::Mat& t2, cv::Mat& K, std::vector<Match2D2D> matches,
+        const float& distance_threshold, const float& reprojection_threshold){
+
+            cv::Mat P0(3, 4, CV_64F), P1(3, 4, CV_64F);
+            R1.copyTo(P0.colRange(0, 3));
+            t1.copyTo(P0.col(3));
+            R2.copyTo(P1.colRange(0, 3));
+            t2.copyTo(P1.col(3));
+            P0 = K * P0;
+            P1 = K * P1;
+
+            std::vector<cv::Point2d> inlierPoints0, inlierPoints1;
+            inlierPoints0.reserve(matches.size());
+            inlierPoints1.reserve(matches.size());
+            for (const auto& m : matches) {
+                inlierPoints0.push_back(m.p0);
+                inlierPoints1.push_back(m.p1);
+            }
+
+            cv::Mat X4;
+            cv::triangulatePoints(P0, P1, inlierPoints0, inlierPoints1, X4);
+
+            std::vector<cv::Point3d> points3d;
+            std::vector<Match2D2D> filteredPairs;
+            points3d.reserve(X4.cols);
+            filteredPairs.reserve(X4.cols);
+
+            cv::Mat T1 = cv::Mat::eye(4, 4, CV_64F);  
+            R1.copyTo(T1(cv::Rect(0, 0, 3, 3)));       
+            t1.copyTo(T1(cv::Rect(3, 0, 1, 3))); 
+
+            cv::Mat T2 = cv::Mat::eye(4, 4, CV_64F);  
+            R2.copyTo(T2(cv::Rect(0, 0, 3, 3)));       
+            t2.copyTo(T2(cv::Rect(3, 0, 1, 3))); 
+
+            for (int i = 0; i < X4.cols; ++i) {
+                double w = X4.at<double>(3, i);
+                if (std::abs(w) < 1e-9) continue; // Removed degenerate cases
+
+                cv::Mat X4_cam1 = T1 * X4.col(i); // Transform point i into cam1 frame
+                double Z_cam1 = X4_cam1.at<double>(2, 0) / w;
+                if (Z_cam1 <= 0 || Z_cam1 > distance_threshold) continue; // checked if point is in front of the camera1
+
+                cv::Mat X4_cam2 = T2 * X4.col(i); // Transform point i into cam2 frame
+                double Z_cam2 = X4_cam2.at<double>(2, 0) / w;
+                if (Z_cam2 <= 0 || Z_cam2 > distance_threshold) continue; // checked if point is in front of the camera2
+
+                //reprojection error filter for cam1 
+                cv::Point2d observed_uv = matches[i].p0;
+                cv::Mat uv_homogeneous = K * (X4_cam1.rowRange(0, 3) / w);
+
+                double u = uv_homogeneous.at<double>(0, 0) / uv_homogeneous.at<double>(2, 0); 
+                double v = uv_homogeneous.at<double>(1, 0) / uv_homogeneous.at<double>(2, 0);
+
+                double reproj_error = cv::norm(cv::Point2d(u, v) - observed_uv);
+                if (reproj_error > reprojection_threshold) continue;
+
+                //reprojection error filter for cam2
+                observed_uv = matches[i].p1;
+                uv_homogeneous = K * (X4_cam2.rowRange(0, 3) / w);         
+
+                u = uv_homogeneous.at<double>(0, 0) / uv_homogeneous.at<double>(2, 0);
+                v = uv_homogeneous.at<double>(1, 0) / uv_homogeneous.at<double>(2, 0);
+
+                reproj_error = cv::norm(cv::Point2d(u, v) - observed_uv);
+                if (reproj_error > reprojection_threshold) continue;
+
+
+                double Z = X4.at<double>(2, i) / w;
+                double X = X4.at<double>(0, i) / w;
+                double Y = X4.at<double>(1, i) / w;
+
+                points3d.emplace_back(X, Y, Z);
+
+                // Corresponding inlier pair at same index i
+                filteredPairs.push_back(matches[i]);
+            }
+
+            std::cout << "Triangulated " << points3d.size() << " 3D points." << std::endl;
+
+            return std::make_tuple(points3d, filteredPairs);
+
+        }
 
 }

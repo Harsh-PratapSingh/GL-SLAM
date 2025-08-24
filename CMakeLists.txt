@@ -36,6 +36,7 @@ link_directories(
 set(CMAKE_SKIP_BUILD_RPATH FALSE)          # Include rpath in build
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)   # Use rpath immediately
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE) # Add linked library paths
+set(CMAKE_BUILD_TYPE Debug)
 
 # # OpenCV from third_party
 # include_directories(
