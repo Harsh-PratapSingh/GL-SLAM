@@ -538,7 +538,7 @@ namespace slam_core {
 
             for (int i = 0; i < X4.cols; ++i) {
                 double w = X4.at<double>(3, i);
-                if (std::abs(w) < 1e-9) continue; // Removed degenerate cases
+                if (std::abs(w) < 1e-5) continue; // Removed degenerate cases
 
                 cv::Mat X4_cam1 = T1 * X4.col(i); // Transform point i into cam1 frame
                 double Z_cam1 = X4_cam1.at<double>(2, 0) / w;
@@ -616,11 +616,11 @@ namespace slam_core {
             R = R.t();
             t = -R * t;
 
-            cv::Mat R2 = R * R1;
-            cv::Mat t2 = R * t1 + t;
+            // cv::Mat R2 = R1 * R;
+            // cv::Mat t2 = t1 + R1 * t;
 
-            frame.R = R2.clone();
-            frame.t = t2.clone();
+            frame.R = R.clone();
+            frame.t = t.clone();
             frame.sp_res = Result;
             frame.is_keyframe = true;
 
@@ -631,11 +631,11 @@ namespace slam_core {
             auto R1 = map.keyframes[frame.id-1].R;       
             auto t1 = map.keyframes[frame.id-1].t; 
 
-            cv::Mat R2 = R * R1;
-            cv::Mat t2 = R * t1 + t;
+            // cv::Mat R2 = R1 * R;
+            // cv::Mat t2 = t1 + R1 * t;
 
-            frame.R = R2.clone();
-            frame.t = t2.clone();
+            frame.R = R.clone();
+            frame.t = t.clone();
             frame.sp_res = Result;
             frame.is_keyframe = true;
 

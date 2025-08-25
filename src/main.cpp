@@ -10,7 +10,9 @@
 #include <fstream>
 #include <sstream>
 
+
 #include <chrono> // for time measurement
+
 
 // NEW: Compact record carrying original SP indices and 2D locations
 // struct Match2D2D {
@@ -19,6 +21,7 @@
 //     cv::Point2f p0;   // 2D point in frame0
 //     cv::Point2f p1;   // 2D point in frame1
 // };
+
 
 static std::vector<cv::Mat> loadKittiPoses4x4(const std::string& posesPath) {
     std::ifstream f(posesPath);
@@ -39,6 +42,7 @@ static std::vector<cv::Mat> loadKittiPoses4x4(const std::string& posesPath) {
     return poses;
 }
 
+
 static cv::Mat invertSE3(const cv::Mat& T) {
     cv::Mat R = T(cv::Rect(0,0,3,3)).clone();
     cv::Mat t = T(cv::Rect(3,0,1,3)).clone();
@@ -49,6 +53,7 @@ static cv::Mat invertSE3(const cv::Mat& T) {
     t_inv.copyTo(Tinv(cv::Rect(3,0,1,3)));
     return Tinv;
 }
+
 
 static double angleBetweenVectorsDeg(const cv::Mat& a, const cv::Mat& b) {
     cv::Mat af, bf;
@@ -61,24 +66,31 @@ static double angleBetweenVectorsDeg(const cv::Mat& a, const cv::Mat& b) {
     return std::acos(cosang) * 180.0 / CV_PI;
 }
 
+
 static double rotationAngleErrorDeg(const cv::Mat& R_est, const cv::Mat& R_gt) {
     cv::Mat R_err = R_gt.t() * R_est;
     double tr = std::max(-1.0, std::min(1.0, (R_err.at<double>(0,0) + R_err.at<double>(1,1) + R_err.at<double>(2,2) - 1.0) * 0.5));
     return std::acos(tr) * 180.0 / CV_PI;
 }
 
+
 int main() {
     SuperPointTRT sp;
     LightGlueTRT lg;
     slam_core::superpoint_lightglue_init(sp, lg);
 
+
+    std::string img_dir_path = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/image_0/";
+    
     // Load camera matrix from calib.txt
     std::string calibPath = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/calib.txt";
     auto cameraMatrix = slam_core::load_camera_matrix(calibPath);
     std::cout << "Camera Matrix:\n" << cameraMatrix << std::endl;
 
+
     std::string posesPath = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/00.txt";
     auto gtPoses = slam_core::load_poses(posesPath);
+
 
     cv::Mat img0 = cv::imread("temp3.png", cv::IMREAD_GRAYSCALE);
     cv::Mat img1 = cv::imread("temp4.png", cv::IMREAD_GRAYSCALE);
@@ -86,14 +98,17 @@ int main() {
         throw std::runtime_error("Failed to load image0.png or image1.png");
     }
 
+
     auto spRes0 = sp.runInference(img0, img0.rows, img0.cols);
     auto spRes1 = sp.runInference(img1, img1.rows, img1.cols);
     std::cout << "Image0: valid keypoints = " << spRes0.numValid << std::endl;
     std::cout << "Image1: valid keypoints = " << spRes1.numValid << std::endl;
 
+
     auto lgRes = lg.run_Direct_Inference(spRes0, spRes1);
     int nMatches = 0;
     const float match_thr = 0.7f;
+
 
     // Build compact matches directly
     auto matches = slam_core::lightglue_score_filter(lgRes, match_thr);
@@ -102,14 +117,18 @@ int main() {
         return 1;
     }
 
+
     auto [R, t, mask] = slam_core::pose_estimator(matches, cameraMatrix);
 
+
     auto inliersPairs = slam_core::pose_estimator_mask_filter(matches, mask);
+
 
     // R = R.t();
     // t = -R * t;
     // Scale translation to GT magnitude (compare against T_w1)
     t = slam_core::adjust_translation_magnitude(gtPoses, t, 1);
+
 
     cv::Mat R1 = cv::Mat::eye(3, 3, CV_64F);
     cv::Mat t1 = cv::Mat::zeros(3, 1, CV_64F);
@@ -119,145 +138,187 @@ int main() {
                                             filteredPairs, spRes0, img0, true, true);
 
 
+
     // ===================== PnP on next image (temp5.png) =====================
-    cv::Mat img2 = cv::imread("temp5.png", cv::IMREAD_GRAYSCALE);
-    if (img2.empty()) {
-        throw std::runtime_error("Failed to load temp5.png");
-    }
-
-    // Example timing block around LightGlue
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // 1) Run SuperPoint on temp5
-    SuperPointTRT::Result spRes2 = sp.runInference(img2, img2.rows, img2.cols);
-    std::cout << "Image2: valid keypoints = " << spRes2.numValid << std::endl;
+    
+    // After your two-view bootstrap and initial map update:
+    auto fmt_name = [](int idx) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%06d.png", idx);
+        return std::string(buf);
+    };
 
 
-    // 2) Match frame1 (map-stored SP data) to frame2 (fresh SP)
-    LightGlueTRT::Result lgRes12 = lg.run_Direct_Inference(
-        // Left: frame1 data from the map (SuperPoint arrays)
-        // Wrap into SuperPointTRT::Result-like shallow containers if needed
-        // Here we assume run_Direct_Inference accepts a Result struct with .keypoints/.descriptors vectors.
-        spRes1,
-        spRes2
-    );
+    // const float match_thr = 0.7f;
+    int prev_kfid = 1;            // last keyframe inserted during bootstrap (frame 1)
+    int start_idx = 2;            // third image
+    int max_idx   = 200;           // or drive by gtPoses.size()-1
 
 
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    for (int idx = start_idx; idx <= max_idx; ++idx) {
+        // 1) Load current image and SuperPoint
+        std::string img_path = img_dir_path + fmt_name(idx);
+        cv::Mat img_cur = cv::imread(img_path, cv::IMREAD_GRAYSCALE);
+        if (img_cur.empty()) {
+            std::cerr << "[PnP-Loop] Could not load " << img_path << ", stopping.\n";
+            break;
+        }
+        auto spRes_cur = sp.runInference(img_cur, img_cur.rows, img_cur.cols);
 
-    std::cout << "LightGlue inference took " << duration_ms << " ms" << std::endl;
 
-    // 3) Build 3D-2D correspondences using kp_to_mpid from frame1
-    std::vector<cv::Point3f> pts3d; pts3d.reserve(spRes2.numValid);
-    std::vector<cv::Point2f> pts2d; pts2d.reserve(spRes2.numValid);
+        // 2) Prev keyframe (features live in sp_res)
+        auto kf_prev = map.keyframes[prev_kfid];
 
-    const auto& kf1 = map.keyframes[1];
-    const float score_thr = 0.7f;
 
-    // For each keypoint in frame1 that matched to frame2, if it has a mapped 3D point, use it
-    int used = 0;
-    int count = 0;
-    for (int i = 0, n1 = (int)kf1.keypoints.size()/2; i < n1; ++i) {
-        int j = lgRes12.matches0[i];
-        if (j < 0 || lgRes12.mscores0[i] <= score_thr) continue;
+        // 3) Match prev ↔ cur with LightGlue
+        auto lgRes_prev_cur = lg.run_Direct_Inference(kf_prev.sp_res, spRes_cur);
 
-        int mpid = -1;
-        if (i < (int)kf1.kp_to_mpid.size()) mpid = kf1.kp_to_mpid[i];
-        if (mpid < 0) {
-            count++;
+
+        auto all_pairs = slam_core::lightglue_score_filter(lgRes_prev_cur, match_thr);
+
+
+        // 4) Build 3D–2D (from prev’s kp_to_mpid) for PnP
+        std::vector<cv::Point3f> p3d_pnp;
+        std::vector<cv::Point2f> p2d_pnp;
+        p3d_pnp.reserve(spRes_cur.numValid);
+        p2d_pnp.reserve(spRes_cur.numValid);
+
+
+        int used3d = 0, skipped_no3d = 0;
+        const auto kp2mp = kf_prev.kp_to_mpid;
+        int n_prev = kf_prev.sp_res.numValid;
+
+
+        for (int i = 0; i < n_prev; ++i) {
+            int j = lgRes_prev_cur.matches0[i];
+            if (j < 0 || lgRes_prev_cur.mscores0[i] <= match_thr) continue;
+
+
+            int mpid = (i < (int)kp2mp.size()) ? kp2mp[i] : -1;
+            if (mpid < 0) { skipped_no3d++; continue; }
+
+
+            auto it = map.map_points.find(mpid);
+            if (it == map.map_points.end() || it->second.is_bad) continue;
+
+
+            const cv::Point3f Pw = it->second.position;
+            p3d_pnp.emplace_back(Pw);
+
+
+            float x = (float)lgRes_prev_cur.keypoints1[2 * j];
+            float y = (float)lgRes_prev_cur.keypoints1[2 * j + 1];
+            p2d_pnp.emplace_back(x, y);
+            used3d++;
+        }
+        std::cout << "[PnP-Loop] Frame " << idx << ": 3D-2D for PnP = " << used3d
+                << " (no-3D=" << skipped_no3d << ")\n";
+
+
+        if ((int)p3d_pnp.size() < 4) {
+            std::cerr << "[PnP-Loop] Not enough 3D–2D; skipping frame " << idx << "\n";
             continue;
-         } // no 3D point for this 2D kp in frame1
+        }
 
-        auto mp_it = map.map_points.find(mpid);
-        if (mp_it == map.map_points.end()) continue;
 
-        const MapPoint& mp = mp_it->second;
-        pts3d.emplace_back(mp.position); // world coords
+        // 5) PnP (world->camera)
+        cv::Mat rvec, tvec, R_cur;
+        std::vector<int> inliers_pnp;
+        cv::Mat distCoeffs = cv::Mat::zeros(4,1,CV_64F);
+        bool ok_pnp = cv::solvePnPRansac(
+            p3d_pnp, p2d_pnp, cameraMatrix, distCoeffs,
+            rvec, tvec, false, 5000, 1.8, 0.999, inliers_pnp, cv::SOLVEPNP_ITERATIVE
+        );
+        if (!ok_pnp || (int)inliers_pnp.size() < 4) {
+            std::cerr << "[PnP-Loop] PnP failed/low inliers at frame " << idx << "\n";
+            continue;
+        }
+        cv::Rodrigues(rvec, R_cur);
+        cv::Mat t_cur = tvec.clone(); // x_cam = R_cur * X_world + t_cur (world->cam)
 
-        // 2D point in frame2 (temp5) from LightGlue keypoints1
-        float x2 = (float)lgRes12.keypoints1[2 * j];
-        float y2 = (float)lgRes12.keypoints1[2 * j + 1];
-        pts2d.emplace_back(x2, y2);
-        ++used;
+
+        R_cur = R_cur.t();
+        t_cur = -R_cur * t_cur;
+
+
+        // 6) Compare with GT
+        if ((int)gtPoses.size() > idx) {
+            const cv::Mat T_wi = gtPoses[idx];
+            cv::Mat R_gt = T_wi(cv::Rect(0,0,3,3)).clone();
+            cv::Mat t_gt = T_wi(cv::Rect(3,0,1,3)).clone();
+
+
+            double rot_err = rotationAngleErrorDeg(R_cur, R_gt);
+            double t_dir_err = angleBetweenVectorsDeg(t_cur, t_gt);
+            double t_mag_err = std::abs(cv::norm(t_cur) - cv::norm(t_gt));
+            std::cout << "[PnP-Loop] Frame " << idx << " | rot(deg): " << rot_err
+                    << " t_dir(deg): " << t_dir_err << " t_mag(m): " << t_mag_err << "\n";
+        }
+
+
+        // 7) Build the “rest” 2D–2D pairs (no 3D yet in prev) for triangulation
+        // Use your LightGlue score filter to keep a clean set first
+        // auto all_pairs = slam_core::lightglue_score_filter(lgRes_prev_cur, match_thr);
+
+
+        // Split into: restPairs (idx0/idx1/p0/p1) where prev has no 3D
+        std::vector<Match2D2D> restPairs;
+        restPairs.reserve(all_pairs.size());
+        for (const auto& m : all_pairs) {
+            int i_prev = m.idx0;
+            if (i_prev < 0 || i_prev >= n_prev) continue;
+            int mpid = (i_prev < (int)kp2mp.size()) ? kp2mp[i_prev] : -1;
+            if (mpid >= 0) continue;  // already has 3D
+            restPairs.push_back(m);
+        }
+
+
+        std::cout << "Rest = " << restPairs.size() << std::endl;
+
+
+        // 8) Triangulate-and-filter the “rest” using your helper (world->cam convention)
+        //    Pprev = K[R_prev|t_prev], Pcur = K[R_cur|t_cur]
+        cv::Mat R_prev = kf_prev.R;
+        cv::Mat t_prev = kf_prev.t;
+        R_prev = R_prev.t();
+        t_prev = -R_prev * t_prev;
+        R_cur = R_cur.t();
+        t_cur = -R_cur * t_cur;
+        
+
+
+        auto [newPoints3D, newPairs] =
+            slam_core::triangulate_and_filter_3d_points(R_prev, t_prev, R_cur, t_cur,
+                                                        cameraMatrix, restPairs,
+                                                        /*maxZ*/ 500.0, /*minCosParallax*/ 0.5);
+
+
+        std::cout << "[PnP-Loop] Frame " << idx << " triangulated-new = " << newPoints3D.size() << "\n";
+
+
+        // 9) Update map & keyframes via your helper (writes sp_res, kp_to_mpid, observations, etc.)
+        //    Note: pass prev’s sp_res and the new current sp_res so the helper can wire indices correctly.
+        slam_core::update_map_and_keyframe_data(
+            map,
+            /*img_cur*/ img_cur,
+            /*R_cur*/   R_cur,
+            /*t_cur*/   t_cur,
+            /*spRes_cur*/ spRes_cur,
+            /*points3d*/ newPoints3D,
+            /*pairs*/    newPairs,
+            /*spRes_prev*/ kf_prev.sp_res,
+            /*img_prev*/  kf_prev.img,   // ensure kf_prev.img was stored at bootstrap
+            /*is_prev_kf*/ false,
+            /*is_cur_kf*/  true
+        );
+
+
+        // 10) Advance: current frame inserted with the next id; set prev_kfid to last inserted
+        // If your helper increments ids internally, the last inserted keyframe id should be map.next_keyframe_id - 1
+        prev_kfid = map.next_keyframe_id - 1;
     }
 
-    std::cout << "PnP correspondences: " << used << " (3D-2D)" << count << std::endl;
-    if ((int)pts3d.size() < 4) {
-        std::cerr << "Not enough correspondences for PnP." << std::endl;
-        // You can return or continue with a fallback here
-        return 1;
-    }
 
-    // 4) Run PnP (world → camera)
-    cv::Mat distCoeffs = cv::Mat::zeros(4,1,CV_64F); // replace with real distortion if you have it
-    cv::Mat rvec2, tvec2;
-    std::vector<int> inliers_pnp;
-    bool ok_pnp = cv::solvePnPRansac(
-        pts3d, pts2d,
-        cameraMatrix, distCoeffs,
-        rvec2, tvec2,
-        false,         // useExtrinsicGuess
-        1000,          // iterationsCount
-        1.8,           // reprojectionError (px)
-        0.999,         // confidence
-        inliers_pnp,
-        cv::SOLVEPNP_ITERATIVE
-    );
-    
-
-    
-    if (!ok_pnp || (int)inliers_pnp.size() < 4) {
-        std::cerr << "PnP failed or insufficient inliers: " << inliers_pnp.size() << std::endl;
-        return 1;
-    }
-
-    // Convert to rotation matrix
-    cv::Mat R2;
-    cv::Rodrigues(rvec2, R2);
-    cv::Mat t2 = tvec2.clone();
-
-    // OpenCV PnP gives world→camera: x_cam = R2*X_world + t2
-    // Store frame2 pose
-    Frame frame2;
-    frame2.id = map.next_keyframe_id++;
-    frame2.img = img2;
-    R2 = R2.t();
-    t2 = -R2 * t2;
-
-    // Scale translation to GT magnitude (compare against T_w1)
-    cv::Mat T_w2 = gtPoses[2];
-    cv::Mat t_gt2 = T_w2(cv::Rect(3,0,1,3)).clone();
-    double t_gt_mag2 = cv::norm(t_gt2);
-    // t2 *= (t_gt_mag2 / cv::norm(t2));
-
-    frame2.R = R2.clone();
-    frame2.t = t2.clone();
-    frame2.keypoints = spRes2.keypoints;
-    frame2.descriptors = spRes2.descriptors;
-    frame2.is_keyframe = false; // mark as you wish
-
-    // Add to map
-    map.keyframes[frame2.id] = std::move(frame2);
-
-    std::cout << "Frame2 PnP inliers: " << inliers_pnp.size() << std::endl;
-    std::cout << "Frame2 R (world->cam):\n" << R2 << std::endl;
-    std::cout << "Frame2 t (world->cam):\n" << t2 << std::endl;
-
-    // 5) Compare with ground truth pose for frame index 2 (third image)
-    if (gtPoses.size() > 2) {
-        cv::Mat R_gt2 = T_w2(cv::Rect(0,0,3,3)).clone();
-
-        double rot_err_deg_2 = rotationAngleErrorDeg(R2, R_gt2);
-        double t_dir_err_deg_2 = angleBetweenVectorsDeg(t2, t_gt2);
-        double t_mag_err_2 = std::abs(cv::norm(t2) - cv::norm(t_gt2));
-
-        std::cout << "Frame2 rotation error (deg): " << rot_err_deg_2 << std::endl;
-        std::cout << "Frame2 translation direction error (deg): " << t_dir_err_deg_2 << std::endl;
-        std::cout << "Frame2 translation magnitude error (m): " << t_mag_err_2 << std::endl;
-    } else {
-        std::cerr << "Ground-truth does not contain pose for frame 2." << std::endl;
-    }
 
     // Visualize inliers on the second image (frame1)
     // cv::Mat img1_color;
@@ -272,147 +333,7 @@ int main() {
     // cv::waitKey(0);
 
 
-    // ---------------- TRIANGULATE ALL FRAME0 KEYPOINTS THAT HAVE A MATCH ----------------
-    // We already have matches and mask from E/pose estimation.
-    // If you truly want "all" keypoints of frame0, we will attempt triangulation for every kp
-    // that has a LightGlue match in frame1 (even if it was not an inlier of the essential matrix).
-    // However, for stability we will prefer using inliers. If you want strictly all matched,
-    // replace 'inliersPairs' with 'matches' and skip the mask filtering above.
 
-    // To satisfy instruction (1), we’ll triangulate for every valid LightGlue match (not only inliers):
-    std::vector<cv::Point2f> allPts0, allPts1;
-    std::vector<int> allIdx0, allIdx1;
-    allPts0.reserve(matches.size());
-    allPts1.reserve(matches.size());
-    allIdx0.reserve(matches.size());
-    allIdx1.reserve(matches.size());
-    for (const auto& m : matches) {
-        allPts0.push_back(m.p0);
-        allPts1.push_back(m.p1);
-        allIdx0.push_back(m.idx0);
-        allIdx1.push_back(m.idx1);
-    }
-
-    // Use the same P0, P1 from above (P0 = K[I|0], P1 = K[R|t] with R,t from recoverPose before your R=t() invert)
-    // We have already built P0 and P1 earlier prior to inlier triangulation.
-    // Rebuild quickly here to be explicit:
-    {
-        cv::Mat I3 = cv::Mat::eye(3, 3, CV_64F);
-        cv::Mat Rt2(3,4,CV_64F), PP0(3,4,CV_64F), PP1(3,4,CV_64F);
-        I3.copyTo(PP0.colRange(0,3));            // [I|0]
-        PP0.col(3) = cv::Mat::zeros(3,1,CV_64F);
-        R = R.t();
-        t = -R * t;
-        R.copyTo(Rt2.colRange(0,3));              // R from recoverPose (cam0->cam1)
-        t.copyTo(Rt2.col(3));                     // t from recoverPose (cam0->cam1)
-        PP0 = cameraMatrix * PP0;
-        PP1 = cameraMatrix * Rt2;
-
-        cv::Mat X4_all;
-        cv::triangulatePoints(PP0, PP1, allPts0, allPts1, X4_all);
-        X4_all.convertTo(X4_all, CV_64FC1);
-
-        // Build triangulated 3D points for every matched kp in frame0 (where valid)
-        struct TriRec { cv::Point3d X; int idx0; int idx1; };
-        std::vector<TriRec> triRecords;
-        triRecords.reserve(X4_all.cols);
-
-        for (int i = 0; i < X4_all.cols; ++i) {
-            double w = X4_all.at<double>(3, i);
-            if (std::abs(w) < 1e-9) continue;
-            double X = X4_all.at<double>(0, i) / w;
-            double Y = X4_all.at<double>(1, i) / w;
-            double Z = X4_all.at<double>(2, i) / w;
-            // simple cheirality w.r.t cam0 and cam1 (positive depth in both):
-            // For cam0: depth is Z0 = [I|0] -> just Z
-            // For cam1: depth Z1 ~ third component of R*X + t; approximate via PP1 third row
-            cv::Mat Xw = (cv::Mat_<double>(4,1) << X, Y, Z, 1.0);
-            double z0 = Z;
-            cv::Mat row2 = PP1.row(2);  // Extract row as cv::Mat
-            cv::Mat res = row2 * Xw;    // Perform multiplication
-            double z1 = res.at<double>(0, 0);  // Access the element            
-            if (z0 <= 0.0 || z1 <= 0.0 || Z > 1e5) continue; // clamp far points
-
-            triRecords.push_back({ cv::Point3d(X, Y, Z), allIdx0[i], allIdx1[i] });
-        }
-
-        std::cout << "Triangulated (all matched from frame0) valid count: " << triRecords.size() << std::endl;
-
-        // ---------------- BUILD SYNTHETIC FRAME S (1241x376) AT SAME POSE AS FRAME1 ----------------
-        // Synthetic frame S: same pose as frame1 in your final convention.
-        // Your final frame1 pose is camera1->world inverted (you flipped R,t below).
-        // For projection we need world->cam of frame1. We can use the "cam0->cam1" pose (R,t) before inversion.
-        // We'll compute projection with the cam1 (world->cam) from the recoverPose stage: x1 ~ K [R|t] X0
-        // Since our X are in the cam0/world implied by P0=K[I|0], we can project with PP1 (camera 1).
-        // Synthetic image size:
-        const int synthW = 1241, synthH = 376;
-
-        // Prepare synthetic "SuperPoint-like" container with projected keypoints and descriptors from frame0
-        SuperPointTRT::Result spResSynth;
-        spResSynth.keypoints.clear();
-        spResSynth.descriptors.clear();
-
-        spResSynth.keypoints.reserve(triRecords.size() * 2);
-        spResSynth.descriptors.reserve(triRecords.size() * 256);
-
-        // Project each triangulated 3D point into synthetic frame S using PP1 (K[R|t])
-        int kept = 0;
-        for (const auto& rec : triRecords) {
-            cv::Mat Xw_(4,1,CV_64F);
-            Xw_.at<double>(0)=rec.X.x; Xw_.at<double>(1)=rec.X.y; Xw_.at<double>(2)=rec.X.z; Xw_.at<double>(3)=1.0;
-            cv::Mat proj = P1 * Xw_; // P1 was earlier K[R|t], ensure it's consistent with recoverPose stage
-            double u = proj.at<double>(0) / proj.at<double>(2);
-            double v = proj.at<double>(1) / proj.at<double>(2);
-            if (proj.at<double>(2) <= 0.0) continue;
-            if (u < 0 || u >= synthW || v < 0 || v >= synthH) continue;
-
-            // push keypoint (x,y) into synthetic keypoint array
-            spResSynth.keypoints.push_back((float)u);
-            spResSynth.keypoints.push_back((float)v);
-
-            // copy descriptor from frame0 for idx0 (most recent descriptor could also be from frame1)
-            // frame0.descriptors is a flat array (N0 * 256). Use rec.idx0 to index
-            const float* d0 = &spRes0.descriptors[rec.idx0 * 256];
-            spResSynth.descriptors.insert(spResSynth.descriptors.end(), d0, d0 + 256);
-            ++kept;
-        }
-        spResSynth.numValid = kept;
-        std::cout << "Synthetic projected points kept in-view: " << spResSynth.numValid << std::endl;
-
-        // ---------------- RUN LIGHTGLUE: synthetic S vs real current frame1 ----------------
-        // As requested: "run lightglue with those keypoints on this image and descriptors"
-        // We'll match the synthetic frame S to the real frame1 SuperPoint result spRes1.
-        auto lg_start = std::chrono::high_resolution_clock::now();
-        LightGlueTRT::Result lgRes_S_1 = lg.run_Direct_Inference(spResSynth, spRes0);
-        auto lg_end = std::chrono::high_resolution_clock::now();
-        auto lg_ms = std::chrono::duration_cast<std::chrono::milliseconds>(lg_end - lg_start).count();
-        std::cout << "LightGlue (Synthetic vs frame1) took " << lg_ms << " ms, matches=";
-
-        int mcountS = 0;
-        for (int i = 0; i < spResSynth.numValid; ++i) {
-            if (lgRes_S_1.matches0[i] >= 0 && lgRes_S_1.mscores0[i] > match_thr) ++mcountS;
-        }
-        std::cout << mcountS << std::endl;
-
-        // If you want to use these matches for something (e.g., more correspondences for BA or validation),
-        // you can extract them similarly as earlier. Example collect matched (S -> frame1):
-        std::vector<cv::Point2f> synthPts, realPts1;
-        synthPts.reserve(mcountS);
-        realPts1.reserve(mcountS);
-        for (int i = 0; i < spResSynth.numValid; ++i) {
-            int j = lgRes_S_1.matches0[i];
-            if (j >= 0 && lgRes_S_1.mscores0[i] > match_thr) {
-                float xs = (float)lgRes_S_1.keypoints0[2*i];
-                float ys = (float)lgRes_S_1.keypoints0[2*i + 1];
-                float xr = (float)lgRes_S_1.keypoints1[2*j];
-                float yr = (float)lgRes_S_1.keypoints1[2*j + 1];
-                synthPts.emplace_back(xs, ys);
-                realPts1.emplace_back(xr, yr);
-            }
-        }
-        std::cout << "Synthetic vs frame1 good matches (score>" << match_thr << "): " << synthPts.size() << std::endl;
-    }
-    // ---------------- END synthetic matching block ----------------
 
 
     return 0;
