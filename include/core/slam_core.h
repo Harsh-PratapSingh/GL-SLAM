@@ -59,4 +59,9 @@ namespace slam_core {
         cv::Mat& R1, cv::Mat& t1, cv::Mat& R2, cv::Mat& t2, cv::Mat& K, std::vector<Match2D2D> matches,
         const float& distance_threshold, const float& reprojection_threshold);
 
+    void update_map_and_keyframe_data(Map& map, cv::Mat& img, cv::Mat& R, cv::Mat t,
+        SuperPointTRT::Result& Result, std::vector<cv::Point3d>& points3d,
+        std::vector<Match2D2D>& filteredPairs, SuperPointTRT::Result& f_res,
+        cv::Mat& f_img, bool if_first_frame, bool if_R_t_inversed);
+
 }

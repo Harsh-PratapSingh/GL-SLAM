@@ -585,4 +585,102 @@ namespace slam_core {
 
         }
 
+    void update_map_and_keyframe_data(Map& map, cv::Mat& img, cv::Mat& R, cv::Mat t,
+        SuperPointTRT::Result& Result, std::vector<cv::Point3d>& points3d,
+        std::vector<Match2D2D>& filteredPairs, SuperPointTRT::Result& f_res,
+        cv::Mat& f_img, bool if_first_frame = false, bool if_R_t_inversed = false){
+
+        if(if_first_frame){
+            Frame first;
+            first.id = map.next_keyframe_id++;
+            first.img = f_img;
+            first.R = cv::Mat::eye(3,3,CV_64F);
+            first.t = cv::Mat::zeros(3,1,CV_64F);
+            first.sp_res = f_res;
+            first.is_keyframe = true;
+
+            map.keyframes[first.id] = first;
+
+        }
+
+        Frame frame;
+
+        frame.id = map.next_keyframe_id++;
+        frame.img = img;
+
+        if(if_R_t_inversed){
+
+            auto R1 = map.keyframes[frame.id-1].R;       
+            auto t1 = map.keyframes[frame.id-1].t; 
+            
+            R = R.t();
+            t = -R * t;
+
+            cv::Mat R2 = R * R1;
+            cv::Mat t2 = R * t1 + t;
+
+            frame.R = R2.clone();
+            frame.t = t2.clone();
+            frame.sp_res = Result;
+            frame.is_keyframe = true;
+
+            map.keyframes[frame.id] = frame;
+
+        }else{
+
+            auto R1 = map.keyframes[frame.id-1].R;       
+            auto t1 = map.keyframes[frame.id-1].t; 
+
+            cv::Mat R2 = R * R1;
+            cv::Mat t2 = R * t1 + t;
+
+            frame.R = R2.clone();
+            frame.t = t2.clone();
+            frame.sp_res = Result;
+            frame.is_keyframe = true;
+
+            map.keyframes[frame.id] = frame;
+        }
+
+        //update map point data
+        map.keyframes[frame.id-1].kp_to_mpid.assign(map.keyframes[frame.id-1].sp_res.keypoints.size()/2, -1);
+        map.keyframes[frame.id].kp_to_mpid.assign(map.keyframes[frame.id].sp_res.keypoints.size()/2, -1);
+
+        for (size_t i = 0; i < points3d.size(); ++i) {
+            const auto& pr = filteredPairs[i];
+
+            MapPoint mp;
+            mp.id = map.next_point_id++;
+            mp.position = cv::Point3d(points3d[i].x, points3d[i].y, points3d[i].z);
+
+            Observation obs0, obs1;
+
+            // Frame 0 observation
+            obs0.keyframe_id = frame.id-1;
+            obs0.kp_index = pr.idx0;
+            const auto& kps0 = map.keyframes[frame.id-1].sp_res.keypoints;
+            obs0.point2D = cv::Point2d(static_cast<double>(kps0[2*obs0.kp_index]), static_cast<double>(kps0[2*obs0.kp_index+1]));
+            map.keyframes[frame.id-1].kp_to_mpid[obs0.kp_index] = mp.id;
+
+            // Frame 1 observation
+            obs1.keyframe_id = frame.id;
+            obs1.kp_index = pr.idx1;
+            const auto& kps1 = map.keyframes[frame.id].sp_res.keypoints;
+            obs1.point2D = cv::Point2d(static_cast<double>(kps1[2*obs1.kp_index]), static_cast<double>(kps1[2*obs1.kp_index+1]));
+            map.keyframes[frame.id].kp_to_mpid[obs1.kp_index] = mp.id;
+
+            mp.obs.push_back(obs0);
+            mp.obs.push_back(obs1);
+            map.keyframes[frame.id-1].map_point_ids.push_back(mp.id);
+            map.keyframes[frame.id].map_point_ids.push_back(mp.id);
+
+            map.map_points[mp.id] = std::move(mp);
+            
+        }
+
+        std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
+              << map.keyframes.size() << " KeyFrames." << std::endl;
+
+    }
+
 }

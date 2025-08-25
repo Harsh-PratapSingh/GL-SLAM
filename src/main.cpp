@@ -114,178 +114,10 @@ int main() {
     cv::Mat R1 = cv::Mat::eye(3, 3, CV_64F);
     cv::Mat t1 = cv::Mat::zeros(3, 1, CV_64F);
     auto [points3d, filteredPairs] = slam_core::triangulate_and_filter_3d_points(R1, t1, R, t, cameraMatrix, inliersPairs, 100.0, 0.5 );
-
-    // // Projection matrices: P0 = K [I|0], P1 = K [R|t]
-    cv::Mat I = cv::Mat::eye(3, 3, CV_64F);
-    cv::Mat Rt(3, 4, CV_64F), P0(3, 4, CV_64F), P1(3, 4, CV_64F);
-    I.copyTo(P0.colRange(0, 3)); // [I|0]
-    P0.col(3) = cv::Mat::zeros(3, 1, CV_64F);
-    R.copyTo(Rt.colRange(0, 3));
-    t.copyTo(Rt.col(3));
-    P0 = cameraMatrix * P0;
-    P1 = cameraMatrix * Rt;
-
-    // // Triangulate using inlier pairs
-    // std::vector<cv::Point2f> inlierPoints0, inlierPoints1;
-    // inlierPoints0.reserve(inliersPairs.size());
-    // inlierPoints1.reserve(inliersPairs.size());
-    // for (const auto& m : inliersPairs) {
-    //     inlierPoints0.push_back(m.p0);
-    //     inlierPoints1.push_back(m.p1);
-    // }
-
-    // cv::Mat X4;
-    // cv::triangulatePoints(P0, P1, inlierPoints0, inlierPoints1, X4);
-    // X4.convertTo(X4, CV_64FC1);
-
-    // // Filter triangulated points and carry pairs forward
-    // std::vector<cv::Point3d> points3d;
-    // std::vector<Match2D2D> filteredPairs;
-    // points3d.reserve(X4.cols);
-    // filteredPairs.reserve(X4.cols);
-
-    // cv::Mat T = cv::Mat::eye(4, 4, CV_64F);  // 4x4 Identity matrix
-    // R.copyTo(T(cv::Rect(0, 0, 3, 3)));       // Copy rotation to top-left 3x3
-    // t.copyTo(T(cv::Rect(3, 0, 1, 3))); 
-
-    // for (int i = 0; i < X4.cols; ++i) {
-    //     double w = X4.at<double>(3, i);
-    //     if (std::abs(w) < 1e-9) continue;
-    //     cv::Mat X4_cam2 = T * X4.col(i); // Transform point i into cam2 frame
-    //     double Z_cam2 = X4_cam2.at<double>(2, 0) / w;
-    //     if (Z_cam2 <= 0 || Z_cam2 > 100) continue;
-
-    //     //reprojection error filter for cam1 
-    //     cv::Point2d observed_uv = inliersPairs[i].p0;
-    //     cv::Mat pt_world = X4.col(i);  // 4x1 homogeneous point
-    //     cv::Mat uv_homogeneous = cameraMatrix * (pt_world.rowRange(0, 3) / w);
-
-    //     double u = uv_homogeneous.at<double>(0, 0) / uv_homogeneous.at<double>(2, 0);
-    //     double v = uv_homogeneous.at<double>(1, 0) / uv_homogeneous.at<double>(2, 0);
-
-    //     double reproj_error = cv::norm(cv::Point2d(u, v) - observed_uv);
-    //     if (reproj_error > 0.5) continue;
-
-    //     //reprojection error filter for cam2
-    //     observed_uv = inliersPairs[i].p1;
-    //     uv_homogeneous = cameraMatrix * (X4_cam2.rowRange(0, 3) / w);         // Project to pixel homogeneous coords
-
-    //     u = uv_homogeneous.at<double>(0, 0) / uv_homogeneous.at<double>(2, 0);
-    //     v = uv_homogeneous.at<double>(1, 0) / uv_homogeneous.at<double>(2, 0);
-
-    //     reproj_error = cv::norm(cv::Point2d(u, v) - observed_uv);
-    //     if (reproj_error > 0.5)continue;
-
-
-    //     double Z = X4.at<double>(2, i) / w;
-    //     double X = X4.at<double>(0, i) / w;
-    //     double Y = X4.at<double>(1, i) / w;
-
-    //     points3d.emplace_back(X, Y, Z);
-
-    //     // Corresponding inlier pair at same index i
-    //     filteredPairs.push_back(inliersPairs[i]);
-    // }
-
-    // std::cout << "Triangulated " << points3d.size() << " 3D points." << std::endl;
-
-    // bookkeeping
     Map map;
-    Frame frame0, frame1;
-    frame0.id = map.next_keyframe_id++;
-    frame1.id = map.next_keyframe_id++;
-    frame0.img = img0;
-    frame1.img = img1;
+    slam_core::update_map_and_keyframe_data(map, img1, R, t, spRes1, points3d,
+                                            filteredPairs, spRes0, img0, true, true);
 
-    frame0.R = cv::Mat::eye(3,3,CV_64F);
-    frame0.t = cv::Mat::zeros(3,1,CV_64F);
-
-    // Convert relative pose to camera1->camera2 then scale translation
-    R = R.t();
-    t = -R * t;
-    // Scale translation to GT magnitude (compare against T_w1)
-    // cv::Mat T_w1 = gtPoses[1];
-    // cv::Mat t_gt = T_w1(cv::Rect(3,0,1,3)).clone();
-    // cv::Mat R_gt = T_w1(cv::Rect(0,0,3,3)).clone();
-    // double t_gt_mag = cv::norm(t_gt);
-    // t *= (t_gt_mag / cv::norm(t));
-
-    frame1.R = R.clone();
-    frame1.t = t.clone();
-    frame0.sp_res = spRes0;
-
-    // Store SuperPoint outputs in frames (single source of truth)
-    frame0.keypoints = spRes0.keypoints;
-    frame1.keypoints = spRes1.keypoints;
-    frame0.descriptors = spRes0.descriptors;
-    frame1.descriptors = spRes1.descriptors;
-    frame0.is_keyframe = true;
-    frame1.is_keyframe = true;
-
-    map.keyframes[frame0.id] = frame0;
-    map.keyframes[frame1.id] = frame1;
-
-    std::cout << "Relative Rotation (R):\n" << R << std::endl;
-    std::cout << "Relative Translation (t):\n" << t << std::endl;
-
-    // Compare with GT
-
-    cv::Mat T_w1 = gtPoses[1];
-    cv::Mat t_gt = T_w1(cv::Rect(3,0,1,3)).clone();
-    cv::Mat R_gt = T_w1(cv::Rect(0,0,3,3)).clone();
-    double t_gt_mag = cv::norm(t_gt);
-    
-    double rot_err_deg = rotationAngleErrorDeg(R, R_gt);
-    double t_dir_err_deg = angleBetweenVectorsDeg(t, t_gt);
-    double t_mag_err = std::abs(cv::norm(t) - t_gt_mag);
-
-    std::cout << "GT |t|: " << t_gt_mag << " m\n";
-    std::cout << "Est |t| (scaled): " << cv::norm(t) << " m\n";
-    std::cout << "Rotation error: " << rot_err_deg << " deg\n";
-    std::cout << "Translation direction error: " << t_dir_err_deg << " deg\n";
-    std::cout << "Translation magnitude error: " << t_mag_err << " m\n";
-
-    // --- Associate triangulated points with MapPoints and Observations ---
-    // Size kp_to_mpid by SuperPoint keypoint counts
-    map.keyframes[frame0.id].kp_to_mpid.assign(map.keyframes[frame0.id].keypoints.size()/2, -1);
-    map.keyframes[frame1.id].kp_to_mpid.assign(map.keyframes[frame1.id].keypoints.size()/2, -1);
-
-    for (size_t i = 0; i < points3d.size(); ++i) {
-        const auto& pr = filteredPairs[i];
-
-        MapPoint mp;
-        mp.id = map.next_point_id++;
-        mp.position = cv::Point3f(points3d[i].x, points3d[i].y, points3d[i].z);
-
-        Observation obs0, obs1;
-
-        // Frame 0 observation
-        obs0.keyframe_id = frame0.id;
-        obs0.kp_index = pr.idx0;
-        {
-            const auto& kps0 = map.keyframes[frame0.id].keypoints;
-            obs0.point2D = cv::Point2f((float)kps0[2*obs0.kp_index], (float)kps0[2*obs0.kp_index+1]);
-        }
-        map.keyframes[frame0.id].kp_to_mpid[obs0.kp_index] = mp.id;
-
-        // Frame 1 observation
-        obs1.keyframe_id = frame1.id;
-        obs1.kp_index = pr.idx1;
-        {
-            const auto& kps1 = map.keyframes[frame1.id].keypoints;
-            obs1.point2D = cv::Point2f((float)kps1[2*obs1.kp_index], (float)kps1[2*obs1.kp_index+1]);
-        }
-        map.keyframes[frame1.id].kp_to_mpid[obs1.kp_index] = mp.id;
-
-        mp.obs.push_back(obs0);
-        mp.obs.push_back(obs1);
-
-        map.map_points[mp.id] = std::move(mp);
-        map.keyframes[frame0.id].map_point_ids.push_back(mp.id);
-        map.keyframes[frame1.id].map_point_ids.push_back(mp.id);
-    }
-    std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
-              << map.keyframes.size() << " KeyFrames." << std::endl;
 
     // ===================== PnP on next image (temp5.png) =====================
     cv::Mat img2 = cv::imread("temp5.png", cv::IMREAD_GRAYSCALE);
@@ -320,7 +152,7 @@ int main() {
     std::vector<cv::Point3f> pts3d; pts3d.reserve(spRes2.numValid);
     std::vector<cv::Point2f> pts2d; pts2d.reserve(spRes2.numValid);
 
-    const auto& kf1 = map.keyframes[frame1.id];
+    const auto& kf1 = map.keyframes[1];
     const float score_thr = 0.7f;
 
     // For each keypoint in frame1 that matched to frame2, if it has a mapped 3D point, use it
