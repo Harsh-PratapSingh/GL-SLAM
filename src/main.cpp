@@ -13,14 +13,13 @@
 
 #include <chrono> // for time measurement
 
+#include <pangolin/pangolin.h>
+#include <thread>
+#include <mutex>
 
-// NEW: Compact record carrying original SP indices and 2D locations
-// struct Match2D2D {
-//     int idx0;         // SuperPoint index in frame0
-//     int idx1;         // SuperPoint index in frame1
-//     cv::Point2f p0;   // 2D point in frame0
-//     cv::Point2f p1;   // 2D point in frame1
-// };
+
+
+
 
 
 static std::vector<cv::Mat> loadKittiPoses4x4(const std::string& posesPath) {
@@ -71,6 +70,87 @@ static double rotationAngleErrorDeg(const cv::Mat& R_est, const cv::Mat& R_gt) {
     cv::Mat R_err = R_gt.t() * R_est;
     double tr = std::max(-1.0, std::min(1.0, (R_err.at<double>(0,0) + R_err.at<double>(1,1) + R_err.at<double>(2,2) - 1.0) * 0.5));
     return std::acos(tr) * 180.0 / CV_PI;
+}
+
+
+std::mutex map_mutex;  // To synchronize map access
+
+void visualize_map(const Map& map) {
+    pangolin::CreateWindowAndBind("SLAM Viewer", 1024, 768);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    pangolin::OpenGlRenderState s_cam(
+        pangolin::ProjectionMatrix(1024, 768, 500, 500, 512, 389, 0.1, 1000),
+        pangolin::ModelViewLookAt(0, -0.1, -1.8, 0, 0, 0, 0.0, -1.0, 0.0)
+    );
+
+    auto& d_cam = pangolin::CreateDisplay()
+        .SetBounds(0.0, 1.0, pangolin::Attach::Pix(175), 1.0, -1024.0f / 768.0f)
+        .SetHandler(new pangolin::Handler3D(s_cam));
+
+    while (!pangolin::ShouldQuit()) {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        d_cam.Activate(s_cam);
+        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+
+        // Lock mutex to safely read map
+        {
+            std::lock_guard<std::mutex> lock(map_mutex);
+
+            // Draw map points as a point cloud
+            glPointSize(1);
+            glBegin(GL_POINTS);
+            glColor3f(0.0, 0.0, 1.0);  // Black points
+            for (const auto& [mpid, mp] : map.map_points) {
+                if (!mp.is_bad) {
+                    // if(mp.position.y > 0.5 || mp.position.y < -1)continue;
+
+                    glVertex3f(mp.position.x, mp.position.y, mp.position.z);
+                }
+            }
+            glEnd();
+
+            // Draw camera poses (as small pyramids or frames)
+            for (const auto& [kfid, kf] : map.keyframes) {
+                cv::Mat T = cv::Mat::eye(4, 4, CV_64F);
+                kf.R.copyTo(T(cv::Rect(0, 0, 3, 3)));
+                kf.t.copyTo(T(cv::Rect(3, 0, 1, 3)));
+
+                // Invert to get world-to-camera if needed (adjust based on your convention)
+                T = invertSE3(T);
+
+                // Draw camera frame (simple axes: red X, green Y, blue Z)
+                float sz = 1.0f;  // Camera size
+                glLineWidth(3);
+                glBegin(GL_LINES);
+                // X axis (red)
+                glColor3f(1.0, 0.0, 0.0);
+                glVertex3f(T.at<double>(0,3), T.at<double>(1,3), T.at<double>(2,3));
+                glVertex3f(T.at<double>(0,3) + sz * T.at<double>(0,0),
+                           T.at<double>(1,3) + sz * T.at<double>(1,0),
+                           T.at<double>(2,3) + sz * T.at<double>(2,0));
+                // Y axis (green)
+                glColor3f(0.0, 1.0, 0.0);
+                glVertex3f(T.at<double>(0,3), T.at<double>(1,3), T.at<double>(2,3));
+                glVertex3f(T.at<double>(0,3) + sz * T.at<double>(0,1),
+                           T.at<double>(1,3) + sz * T.at<double>(1,1),
+                           T.at<double>(2,3) + sz * T.at<double>(2,1));
+                // Z axis (blue)
+                glColor3f(0.0, 0.0, 1.0);
+                glVertex3f(T.at<double>(0,3), T.at<double>(1,3), T.at<double>(2,3));
+                glVertex3f(T.at<double>(0,3) + sz * T.at<double>(0,2),
+                           T.at<double>(1,3) + sz * T.at<double>(1,2),
+                           T.at<double>(2,3) + sz * T.at<double>(2,2));
+                glEnd();
+            }
+        }
+
+        pangolin::FinishFrame();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));  // Update rate
+    }
 }
 
 
@@ -138,6 +218,9 @@ int main() {
                                             filteredPairs, spRes0, img0, true, true);
 
 
+    // After initial map update (bootstrap)
+    std::thread viewer_thread(visualize_map, std::cref(map));
+
 
     // ===================== PnP on next image (temp5.png) =====================
     
@@ -152,7 +235,7 @@ int main() {
     // const float match_thr = 0.7f;
     int prev_kfid = 1;            // last keyframe inserted during bootstrap (frame 1)
     int start_idx = 2;            // third image
-    int max_idx   = 200;           // or drive by gtPoses.size()-1
+    int max_idx   = 500;           // or drive by gtPoses.size()-1
 
 
     for (int idx = start_idx; idx <= max_idx; ++idx) {
@@ -227,11 +310,14 @@ int main() {
         cv::Mat distCoeffs = cv::Mat::zeros(4,1,CV_64F);
         bool ok_pnp = cv::solvePnPRansac(
             p3d_pnp, p2d_pnp, cameraMatrix, distCoeffs,
-            rvec, tvec, false, 5000, 1.8, 0.999, inliers_pnp, cv::SOLVEPNP_ITERATIVE
+            rvec, tvec, false, 1000, 1.8, 0.999, inliers_pnp, cv::USAC_MAGSAC
         );
         if (!ok_pnp || (int)inliers_pnp.size() < 4) {
             std::cerr << "[PnP-Loop] PnP failed/low inliers at frame " << idx << "\n";
             continue;
+        }
+        else{
+            std::cerr << "[PnP-Loop] PnP inliers at frame " << idx << " = " << (int)inliers_pnp.size() << "\n";
         }
         cv::Rodrigues(rvec, R_cur);
         cv::Mat t_cur = tvec.clone(); // x_cam = R_cur * X_world + t_cur (world->cam)
@@ -239,6 +325,8 @@ int main() {
 
         R_cur = R_cur.t();
         t_cur = -R_cur * t_cur;
+
+        t_cur = slam_core::adjust_translation_magnitude(gtPoses, t_cur, idx );
 
 
         // 6) Compare with GT
@@ -290,7 +378,7 @@ int main() {
         auto [newPoints3D, newPairs] =
             slam_core::triangulate_and_filter_3d_points(R_prev, t_prev, R_cur, t_cur,
                                                         cameraMatrix, restPairs,
-                                                        /*maxZ*/ 500.0, /*minCosParallax*/ 0.5);
+                                                        /*maxZ*/ 100.0, /*minCosParallax*/ 0.3);
 
 
         std::cout << "[PnP-Loop] Frame " << idx << " triangulated-new = " << newPoints3D.size() << "\n";
@@ -298,6 +386,7 @@ int main() {
 
         // 9) Update map & keyframes via your helper (writes sp_res, kp_to_mpid, observations, etc.)
         //    Note: pass prev’s sp_res and the new current sp_res so the helper can wire indices correctly.
+        std::lock_guard<std::mutex> lock(map_mutex);
         slam_core::update_map_and_keyframe_data(
             map,
             /*img_cur*/ img_cur,
@@ -332,6 +421,7 @@ int main() {
     // cv::imshow("Inliers on Second Image", img1_color);
     // cv::waitKey(0);
 
+    viewer_thread.join();
 
 
 
