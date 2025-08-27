@@ -62,6 +62,6 @@ namespace slam_core {
     void update_map_and_keyframe_data(Map& map, cv::Mat& img, cv::Mat& R, cv::Mat t,
         SuperPointTRT::Result& Result, std::vector<cv::Point3d>& points3d,
         std::vector<Match2D2D>& filteredPairs, SuperPointTRT::Result& f_res,
-        cv::Mat& f_img, bool if_first_frame, bool if_R_t_inversed);
+        cv::Mat& f_img, std::vector<int>& map_point_id, std::vector<int>& kp_index, bool if_first_frame, bool if_R_t_inversed);
 
 }

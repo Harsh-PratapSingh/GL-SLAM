@@ -214,8 +214,9 @@ int main() {
     cv::Mat t1 = cv::Mat::zeros(3, 1, CV_64F);
     auto [points3d, filteredPairs] = slam_core::triangulate_and_filter_3d_points(R1, t1, R, t, cameraMatrix, inliersPairs, 100.0, 0.5 );
     Map map;
+    std::vector<int> a;
     slam_core::update_map_and_keyframe_data(map, img1, R, t, spRes1, points3d,
-                                            filteredPairs, spRes0, img0, true, true);
+                                            filteredPairs, spRes0, img0, a, a, true, true);
 
 
     // After initial map update (bootstrap)
@@ -235,7 +236,7 @@ int main() {
     // const float match_thr = 0.7f;
     int prev_kfid = 1;            // last keyframe inserted during bootstrap (frame 1)
     int start_idx = 2;            // third image
-    int max_idx   = 500;           // or drive by gtPoses.size()-1
+    int max_idx   = 4540;           // or drive by gtPoses.size()-1
 
 
     for (int idx = start_idx; idx <= max_idx; ++idx) {
@@ -270,6 +271,8 @@ int main() {
         int used3d = 0, skipped_no3d = 0;
         const auto kp2mp = kf_prev.kp_to_mpid;
         int n_prev = kf_prev.sp_res.numValid;
+        std::vector<int> map_point_id;          //exp
+        std::vector<int> kp_index;              //exp
 
 
         for (int i = 0; i < n_prev; ++i) {
@@ -292,6 +295,10 @@ int main() {
             float x = (float)lgRes_prev_cur.keypoints1[2 * j];
             float y = (float)lgRes_prev_cur.keypoints1[2 * j + 1];
             p2d_pnp.emplace_back(x, y);
+
+            map_point_id.push_back(mpid);
+            kp_index.push_back(j);
+            
             used3d++;
         }
         std::cout << "[PnP-Loop] Frame " << idx << ": 3D-2D for PnP = " << used3d
@@ -326,7 +333,8 @@ int main() {
         R_cur = R_cur.t();
         t_cur = -R_cur * t_cur;
 
-        t_cur = slam_core::adjust_translation_magnitude(gtPoses, t_cur, idx );
+        //t_cur = slam_core::adjust_translation_magnitude(gtPoses, t_cur, idx );
+
 
 
         // 6) Compare with GT
@@ -378,7 +386,7 @@ int main() {
         auto [newPoints3D, newPairs] =
             slam_core::triangulate_and_filter_3d_points(R_prev, t_prev, R_cur, t_cur,
                                                         cameraMatrix, restPairs,
-                                                        /*maxZ*/ 100.0, /*minCosParallax*/ 0.3);
+                                                        /*maxZ*/ 100.0, /*minCosParallax*/ 0.1);
 
 
         std::cout << "[PnP-Loop] Frame " << idx << " triangulated-new = " << newPoints3D.size() << "\n";
@@ -397,7 +405,9 @@ int main() {
             /*pairs*/    newPairs,
             /*spRes_prev*/ kf_prev.sp_res,
             /*img_prev*/  kf_prev.img,   // ensure kf_prev.img was stored at bootstrap
-            /*is_prev_kf*/ false,
+            /*map_point_obs_id*/ map_point_id,      //exp
+            /*obs_kp_index*/ kp_index,
+            /*is_first_frame*/ false,
             /*is_cur_kf*/  true
         );
 

@@ -588,7 +588,7 @@ namespace slam_core {
     void update_map_and_keyframe_data(Map& map, cv::Mat& img, cv::Mat& R, cv::Mat t,
         SuperPointTRT::Result& Result, std::vector<cv::Point3d>& points3d,
         std::vector<Match2D2D>& filteredPairs, SuperPointTRT::Result& f_res,
-        cv::Mat& f_img, bool if_first_frame = false, bool if_R_t_inversed = false){
+        cv::Mat& f_img, std::vector<int>& map_point_id, std::vector<int>& kp_index, bool if_first_frame = false, bool if_R_t_inversed = false){
 
         if(if_first_frame){
             Frame first;
@@ -600,6 +600,7 @@ namespace slam_core {
             first.is_keyframe = true;
 
             map.keyframes[first.id] = first;
+            map.keyframes[first.id].kp_to_mpid.assign(map.keyframes[first.id].sp_res.keypoints.size()/2, -1);
 
         }
 
@@ -643,7 +644,9 @@ namespace slam_core {
         }
 
         //update map point data
-        map.keyframes[frame.id-1].kp_to_mpid.assign(map.keyframes[frame.id-1].sp_res.keypoints.size()/2, -1);
+        // if(if_first_frame){
+        //     map.keyframes[frame.id-1].kp_to_mpid.assign(map.keyframes[frame.id-1].sp_res.keypoints.size()/2, -1);
+        // }
         map.keyframes[frame.id].kp_to_mpid.assign(map.keyframes[frame.id].sp_res.keypoints.size()/2, -1);
 
         for (size_t i = 0; i < points3d.size(); ++i) {
@@ -677,6 +680,23 @@ namespace slam_core {
             map.map_points[mp.id] = std::move(mp);
             
         }
+        
+        int obs1 =0 ;
+        if(!map_point_id.empty() || !kp_index.empty()){
+            for(int i = 0; i < map_point_id.size(); ++i){
+                Observation obs;
+                obs.keyframe_id = frame.id;
+                obs.kp_index = kp_index[i];
+                const auto& kps = map.keyframes[frame.id].sp_res.keypoints;
+                obs.point2D = cv::Point2d(static_cast<double>(kps[2*obs.kp_index]), static_cast<double>(kps[2*obs.kp_index+1]));
+                map.keyframes[frame.id].kp_to_mpid[obs.kp_index] = map_point_id[i];
+                map.map_points[map_point_id[i]].obs.push_back(obs);
+                ++obs1;
+            }
+            
+        }
+
+        std::cout << "Updated " << obs1 << " observations" << std::endl;
 
         std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
               << map.keyframes.size() << " KeyFrames." << std::endl;
