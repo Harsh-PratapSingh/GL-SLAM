@@ -703,4 +703,7 @@ namespace slam_core {
 
     }
 
+    // std::vector<int> get_matches_from_previous_frames(Map& map, int& x, SuperPointTRT::Result& sp_res2){
+
+    // }
 }
