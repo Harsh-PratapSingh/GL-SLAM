@@ -682,7 +682,7 @@ namespace slam_core {
         }
         
         int obs1 =0 ;
-        if(!map_point_id.empty() || !kp_index.empty()){
+        if((!map_point_id.empty() || !kp_index.empty()) && !if_first_frame){
             for(int i = 0; i < map_point_id.size(); ++i){
                 Observation obs;
                 obs.keyframe_id = frame.id;
@@ -709,7 +709,8 @@ namespace slam_core {
         int prev_frame_id,
         int i,
         cv::Mat& K,
-        SuperPointTRT::Result& sp_res2)
+        SuperPointTRT::Result& sp_res2,
+        float score)
     {
         const int win = i;
         const int min_kfid = std::max(0, prev_frame_id - win);
@@ -807,7 +808,7 @@ namespace slam_core {
         }
 
         auto lgRes     = lg.run_Direct_Inference(synth, sp_res2);
-        auto lgMatches = slam_core::lightglue_score_filter(lgRes, 0.7f);
+        auto lgMatches = slam_core::lightglue_score_filter(lgRes, score);
 
         SynMatches.reserve(lgMatches.size());
         for (const auto& m : lgMatches) {
@@ -821,4 +822,105 @@ namespace slam_core {
         return SynMatches;
     }
 
-}   
+    std::tuple<cv::Mat, cv::Mat, cv::Mat, SuperPointTRT::Result,
+        std::vector<Match2D2D>, std::vector<int>, std::vector<int>, bool> 
+        run_pnp(Map& map, SuperPointTRT& sp, LightGlueTRT& lg,
+            std::string& img_dir_path, cv::Mat& cameraMatrix, float match_thr,
+            float map_match_thr, int idx, int window){
+
+        int prev_kfid = map.next_keyframe_id - 1; 
+        auto img_name = [](int idx) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%06d.png", idx);
+            return std::string(buf);
+        };
+        bool skip = false;
+
+        std::string img_path = img_dir_path + img_name(idx);
+        cv::Mat img_cur = cv::imread(img_path, cv::IMREAD_GRAYSCALE);
+        if (img_cur.empty()) {
+            std::cerr << "[PnP-Loop] Could not load " << img_path << ", stopping.\n";
+            skip = true;
+        }
+        auto spRes_cur = sp.runInference(img_cur, img_cur.rows, img_cur.cols);
+        auto kf_prev = map.keyframes[prev_kfid];
+        auto lgRes_prev_cur = lg.run_Direct_Inference(kf_prev.sp_res, spRes_cur);
+        auto all_pairs = slam_core::lightglue_score_filter(lgRes_prev_cur, match_thr);
+        auto map_matches = slam_core::get_matches_from_previous_frames(
+            lg, map, idx-1, window, cameraMatrix, spRes_cur, map_match_thr);
+        
+        // 4) Build 3D–2D (from prev’s kp_to_mpid) for PnP
+        std::vector<cv::Point3d> p3d_pnp;
+        std::vector<cv::Point2d> p2d_pnp;
+        std::vector<int> map_point_id;          
+        std::vector<int> kp_index;  
+        std::vector<Match2D2D> restPairs;
+        p3d_pnp.reserve(all_pairs.size());
+        p2d_pnp.reserve(all_pairs.size());
+        map_point_id.reserve(all_pairs.size());
+        kp_index.reserve(all_pairs.size());
+        restPairs.reserve(all_pairs.size());
+                    
+        int used3d = 0, skipped_no3d = 0;
+        int x = 0;
+        auto emplace = [](auto& map, auto mpid, auto& p3d_pnp,
+                auto& p2d_pnp, auto& map_point_id, auto& kp_index,
+                auto& used3d, auto& m){
+                p3d_pnp.emplace_back(map.map_points[mpid].position);
+                p2d_pnp.emplace_back(m.p1);
+                map_point_id.push_back(mpid);
+                kp_index.push_back(m.idx1);
+                used3d++;
+            };
+
+        for (const auto& m : all_pairs) {
+            int mpid = kf_prev.kp_to_mpid[m.idx0];
+            if(mpid > 0){
+                emplace(map, mpid, p3d_pnp, p2d_pnp, map_point_id,
+                kp_index, used3d, m);
+            }else if (map_matches.count(m.idx1)){
+                x++;
+                mpid = map_matches[m.idx1].mpid;
+                emplace(map, mpid, p3d_pnp, p2d_pnp, map_point_id,
+                kp_index, used3d, m);
+            }else{
+                restPairs.push_back(m);
+                skipped_no3d++;
+            }
+        }
+
+        if ((int)p3d_pnp.size() < 4) {
+            std::cerr << "[PnP-Loop] Not enough 3D–2D; skipping frame " << idx << "\n";
+            skip = true;
+        }
+
+        // 5) PnP (world->camera)
+        cv::Mat rvec, tvec, R_cur;
+        std::vector<int> inliers_pnp;
+        cv::Mat distCoeffs = cv::Mat::zeros(4,1,CV_64F);
+        bool ok_pnp = cv::solvePnPRansac(
+            p3d_pnp, p2d_pnp, cameraMatrix, distCoeffs,
+            rvec, tvec, false, 1000, 1.8, 0.999, inliers_pnp, cv::USAC_MAGSAC
+        );
+        if (!ok_pnp || (int)inliers_pnp.size() < 4) {
+            std::cerr << "[PnP-Loop] PnP failed/low inliers at frame " << idx << "\n";
+            skip = true;
+        }
+        cv::Rodrigues(rvec, R_cur);
+        cv::Mat t_cur = tvec.clone(); 
+        R_cur.convertTo(R_cur, CV_64F);
+        t_cur.convertTo(t_cur, CV_64F);
+        R_cur = R_cur.t();
+        t_cur = -R_cur * t_cur;
+
+        // t_cur = slam_core::adjust_translation_magnitude(gtPoses, t_cur, idx );
+
+        std::cout << "[PnP-Loop] Map matches = " << x << std::endl;
+        std::cout << "[PnP-Loop] Matches without Map points = " << restPairs.size() << std::endl;
+        std::cout << "[PnP-Loop] Frame " << idx << ": 3D-2D for PnP = " << used3d
+                << " (no-3D=" << skipped_no3d << ")\n";
+        std::cerr << "[PnP-Loop] PnP inliers at frame " << idx << " = " << (int)inliers_pnp.size() << "\n";
+
+        return std::make_tuple(img_cur, R_cur, t_cur, spRes_cur, restPairs, map_point_id, kp_index, skip);
+    }   
+}

@@ -70,5 +70,14 @@ namespace slam_core {
         int prev_frame_id,
         int i,
         cv::Mat& K,
-        SuperPointTRT::Result& sp_res2);
+        SuperPointTRT::Result& sp_res2,
+        float score
+    );
+
+    std::tuple<cv::Mat, cv::Mat, cv::Mat, SuperPointTRT::Result,
+        std::vector<Match2D2D>, std::vector<int>, std::vector<int>, bool> 
+        run_pnp(Map& map, SuperPointTRT& sp, LightGlueTRT& lg,
+            std::string& img_dir_path, cv::Mat& cameraMatrix, float match_thr,
+            float map_match_thr, int idx, int window);
+
 }
