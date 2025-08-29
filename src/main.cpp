@@ -212,7 +212,7 @@ int main() {
     // R = R.t();
     // t = -R * t;
     // Scale translation to GT magnitude (compare against T_w1)
-    // t = slam_core::adjust_translation_magnitude(gtPoses, t, 1);
+    t = slam_core::adjust_translation_magnitude(gtPoses, t, 1);
 
 
     cv::Mat R1 = cv::Mat::eye(3, 3, CV_64F);
@@ -271,8 +271,8 @@ int main() {
     
 
         // 4) Build 3D–2D (from prev’s kp_to_mpid) for PnP
-        std::vector<cv::Point3f> p3d_pnp;
-        std::vector<cv::Point2f> p2d_pnp;
+        std::vector<cv::Point3d> p3d_pnp;
+        std::vector<cv::Point2d> p2d_pnp;
         p3d_pnp.reserve(spRes_cur.numValid);
         p2d_pnp.reserve(spRes_cur.numValid);
         std::vector<int> map_point_id;          //exp
@@ -280,20 +280,39 @@ int main() {
 
         int used3d = 0, skipped_no3d = 0;
         const auto kp2mp = kf_prev.kp_to_mpid;
-        int n_prev = kf_prev.sp_res.numValid;
+        int n_prev = spRes_cur.numValid;
 
         int x = 0;
         for (int i = 0; i < n_prev; ++i) {
-            int j = lgRes_prev_cur.matches0[i];
+            int j = lgRes_prev_cur.matches1[i];
             
-            if (j < 0 || lgRes_prev_cur.mscores0[i] <= match_thr) continue;
+            if (j < 0 || lgRes_prev_cur.mscores1[i] <= match_thr){
+                if(map_matches.count(i)){
+                    x++;
+                    p3d_pnp.emplace_back(map.map_points[map_matches[i].mpid].position);
+                    
+                    float x = (float)lgRes_prev_cur.keypoints1[2 * i];
+                    float y = (float)lgRes_prev_cur.keypoints1[2 * i + 1];
+                    p2d_pnp.emplace_back(x, y);
+                    map_point_id.push_back(map_matches[i].mpid);
+                    kp_index.push_back(i);
+                }
+                continue;
+            }
 
 
-            int mpid = (i < (int)kp2mp.size()) ? kp2mp[i] : -1;
+            int mpid = (i < (int)kp2mp.size()) ? kp2mp[j] : -1;
             if (mpid < 0) { 
                 skipped_no3d++; 
-                if(map_matches.count(j)){
+                if(map_matches.count(i)){
                     x++;
+                    p3d_pnp.emplace_back(map.map_points[map_matches[i].mpid].position);
+    
+                    float x = (float)lgRes_prev_cur.keypoints1[2 * i];
+                    float y = (float)lgRes_prev_cur.keypoints1[2 * i + 1];
+                    p2d_pnp.emplace_back(x, y);
+                    map_point_id.push_back(map_matches[i].mpid);
+                    kp_index.push_back(i);
                 }
                 continue; 
             }
@@ -303,16 +322,16 @@ int main() {
             if (it == map.map_points.end() || it->second.is_bad) continue;
 
 
-            const cv::Point3f Pw = it->second.position;
+            const cv::Point3d Pw = it->second.position;
             p3d_pnp.emplace_back(Pw);
 
 
-            float x = (float)lgRes_prev_cur.keypoints1[2 * j];
-            float y = (float)lgRes_prev_cur.keypoints1[2 * j + 1];
+            double x = (double)lgRes_prev_cur.keypoints1[2 * i];
+            double y = (double)lgRes_prev_cur.keypoints1[2 * i + 1];
             p2d_pnp.emplace_back(x, y);
 
             map_point_id.push_back(mpid);
-            kp_index.push_back(j);
+            kp_index.push_back(i);
             
             used3d++;
         }
@@ -332,7 +351,7 @@ int main() {
         cv::Mat distCoeffs = cv::Mat::zeros(4,1,CV_64F);
         bool ok_pnp = cv::solvePnPRansac(
             p3d_pnp, p2d_pnp, cameraMatrix, distCoeffs,
-            rvec, tvec, false, 1000, 1.8, 0.999, inliers_pnp, cv::SOLVEPNP_ITERATIVE
+            rvec, tvec, false, 1000, 1.8, 0.999, inliers_pnp, cv::USAC_MAGSAC
         );
         if (!ok_pnp || (int)inliers_pnp.size() < 4) {
             std::cerr << "[PnP-Loop] PnP failed/low inliers at frame " << idx << "\n";
@@ -401,7 +420,7 @@ int main() {
         auto [newPoints3D, newPairs] =
             slam_core::triangulate_and_filter_3d_points(R_prev, t_prev, R_cur, t_cur,
                                                         cameraMatrix, restPairs,
-                                                        /*maxZ*/ 100.0, /*minCosParallax*/ 0.3);
+                                                        /*maxZ*/ 100.0, /*minCosParallax*/ 0.1);
 
 
         std::cout << "[PnP-Loop] Frame " << idx << " triangulated-new = " << newPoints3D.size() << "\n";
