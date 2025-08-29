@@ -63,5 +63,12 @@ namespace slam_core {
         SuperPointTRT::Result& Result, std::vector<cv::Point3d>& points3d,
         std::vector<Match2D2D>& filteredPairs, SuperPointTRT::Result& f_res,
         cv::Mat& f_img, std::vector<int>& map_point_id, std::vector<int>& kp_index, bool if_first_frame, bool if_R_t_inversed);
-
+       
+    std::unordered_map<int, SyntheticMatch> get_matches_from_previous_frames(
+        LightGlueTRT& lg,
+        Map& map,
+        int prev_frame_id,
+        int i,
+        cv::Mat& K,
+        SuperPointTRT::Result& sp_res2);
 }

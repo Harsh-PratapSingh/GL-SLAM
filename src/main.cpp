@@ -212,7 +212,7 @@ int main() {
     // R = R.t();
     // t = -R * t;
     // Scale translation to GT magnitude (compare against T_w1)
-    t = slam_core::adjust_translation_magnitude(gtPoses, t, 1);
+    // t = slam_core::adjust_translation_magnitude(gtPoses, t, 1);
 
 
     cv::Mat R1 = cv::Mat::eye(3, 3, CV_64F);
@@ -241,7 +241,7 @@ int main() {
     // const float match_thr = 0.7f;
     int prev_kfid = 1;            // last keyframe inserted during bootstrap (frame 1)
     int start_idx = 2;            // third image
-    int max_idx   = 6;           // or drive by gtPoses.size()-1
+    int max_idx   = 4000;           // or drive by gtPoses.size()-1
 
 
     for (int idx = start_idx; idx <= max_idx; ++idx) {
@@ -265,164 +265,38 @@ int main() {
 
         auto all_pairs = slam_core::lightglue_score_filter(lgRes_prev_cur, match_thr);
 
+        auto map_matches = slam_core::get_matches_from_previous_frames(
+            lg, map, idx-1, 6, cameraMatrix, spRes_cur);
         // ---- Past-frames projection → synthetic SP result → LightGlue vs current ----
-        // Step 1: collect MapPoints from past X frames, excluding any observed in prev_kfid
-        int X = 7;
-        int min_kfid = std::max(0, prev_kfid - X);
-
-        // Gather all mpids observed in [min_kfid, prev_kfid)
-        std::unordered_set<int> candidate_mpids;
-        for (int kfid = min_kfid; kfid < prev_kfid; ++kfid) {
-            auto itkf = map.keyframes.find(kfid);
-            if (itkf == map.keyframes.end()) continue;
-            const Frame& kf = itkf->second;
-            for (int mpid : kf.kp_to_mpid) {
-                if (mpid >= 0) {
-                    auto itmp = map.map_points.find(mpid);
-                    if (itmp != map.map_points.end() && !itmp->second.is_bad) {
-                        candidate_mpids.insert(mpid);
-                    }
-                }
-            }
-        }
-        // Exclude those observed in the previous keyframe
-        {
-            auto itprev = map.keyframes.find(prev_kfid);
-            if (itprev != map.keyframes.end()) {
-                const Frame& prev_kf_local = itprev->second;
-                for (int mpid : prev_kf_local.kp_to_mpid) {
-                    if (mpid >= 0) candidate_mpids.erase(mpid);
-                }
-            }
-        }
-       
-        std::cout << " Candidate mpid = " << candidate_mpids.size() << std::endl;
-
-        // Step 2: project selected points into the previous frame (synthetic image at prev pose)
-        // prev_kf: camera-to-world (world <- cam); need world->cam for projection
-        const Frame& prev_kf_local = map.keyframes.at(prev_kfid);
-        cv::Mat Rcw = prev_kf_local.R.t();
-        cv::Mat tcw = -Rcw * prev_kf_local.t;
-
-        // Prepare projection outputs with dedup by integer pixels
-        std::vector<cv::Point2d> proj_uv;
-        std::vector<std::array<float, 256>> proj_desc;
-        proj_uv.reserve(candidate_mpids.size());
-        proj_desc.reserve(candidate_mpids.size());
-        std::set<std::pair<int,int>> occupied_px;
-
-        for (int mpid : candidate_mpids) {
-            const MapPoint& mp = map.map_points.at(mpid);
-
-            // Find latest observation among keyframes in [min_kfid, prev_kfid)
-            int latest_kfid = -1;
-            int latest_kpidx = -1;
-            for (const auto& ob : mp.obs) {
-                if (ob.keyframe_id >= min_kfid && ob.keyframe_id < prev_kfid) {
-                    if (ob.keyframe_id > latest_kfid) {
-                        latest_kfid = ob.keyframe_id;
-                        latest_kpidx = ob.kp_index;
-                    }
-                }
-            }
-            if (latest_kfid < 0 || latest_kpidx < 0) continue;
-
-            // std::cout << " latest_kpidx = " << latest_kpidx << std::endl;
-
-            // Pull descriptor from that keyframe (256-d SuperPoint)
-            const Frame& obs_kf = map.keyframes.at(latest_kfid);
-            // std::cout << " descriptors size = " << obs_kf.sp_res.descriptors.size() << std::endl;
-            if ((latest_kpidx + 1) * 256 > obs_kf.sp_res.descriptors.size()) continue;
-            std::array<float, 256> d{};
-            const float* src = obs_kf.sp_res.descriptors.data() + latest_kpidx * 256;
-            std::copy(src, src + 256, d.begin());
-
-            // Project 3D → prev frame
-            cv::Mat Pw = (cv::Mat_<double>(3,1) << mp.position.x, mp.position.y, mp.position.z);
-            cv::Mat Pc = Rcw * Pw + tcw;
-            double Z = Pc.at<double>(2);
-            // std::cout << " Z = " << Z << std::endl;
-            if (Z <= 0.0) continue;
-
-            
-
-            double invz = 1.0 / Z;
-            double x = Pc.at<double>(0) * invz;
-            double y = Pc.at<double>(1) * invz;
-            // u = fx*x + cx, v = fy*y + cy
-            double u = cameraMatrix.at<double>(0,0) * x + cameraMatrix.at<double>(0,2);
-            double v = cameraMatrix.at<double>(1,1) * y + cameraMatrix.at<double>(1,2);
-            if (u < 0 || u >= SYN_W || v < 0 || v >= SYN_H) continue;
-
-            // Step 3: deduplicate by integer pixel coordinates
-            int iu = (int)std::lround(u);
-            int iv = (int)std::lround(v);
-            std::pair<int,int> pix(iu, iv);
-            if (occupied_px.count(pix)) continue;
-            occupied_px.insert(pix);
-
-            proj_uv.emplace_back((float)u, (float)v);
-            proj_desc.emplace_back(d);
-        }
-
-        std::cout << " proj_uv = " << proj_uv.size() << std::endl;
-
-        // Step 4: build synthetic SuperPointTRT::Result (vectors) and run LightGlue vs current
-        std::unordered_set<int> culled_cur_kp;  // indices in current to be culled from triangulation
-        if (!proj_uv.empty()) {
-            SuperPointTRT::Result synth_res;
-            int N = (int)proj_uv.size();
-            synth_res.numValid = N;
-            synth_res.keypoints.resize(2 * N);
-            synth_res.scores.resize(N);
-            synth_res.descriptors.resize(256 * N);
-
-            for (int i = 0; i < N; ++i) {
-                // Interleaved x,y as int64_t (rounded to integer pixel grid)
-                synth_res.keypoints[2 * i + 0] = static_cast<int64_t>(std::lround(proj_uv[i].x));
-                synth_res.keypoints[2 * i + 1] = static_cast<int64_t>(std::lround(proj_uv[i].y));
-                synth_res.scores[i] = 1.0f;
-                std::copy(proj_desc[i].begin(), proj_desc[i].end(), synth_res.descriptors.begin() + i * 256);
-            }
-
-            // LightGlue on synthetic vs current
-            auto lgRes_synth_cur = lg.run_Direct_Inference(synth_res, spRes_cur);
-            auto synth_matches = slam_core::lightglue_score_filter(lgRes_synth_cur, 0.7);
-
-            // Step 5: collect current indices that matched the projected old points
-            for (const auto& m : synth_matches) {
-                if (m.idx1 >= 0) culled_cur_kp.insert(m.idx1);
-            }
-            std::cout << "[Synthetic] proj=" << N
-                    << " matches_to_cur=" << synth_matches.size()
-                    << " culled_cur_idx=" << culled_cur_kp.size() << std::endl;
-        } else {
-            std::cout << "[Synthetic] No valid projected points to match." << std::endl;
-        }
-
-
+    
 
         // 4) Build 3D–2D (from prev’s kp_to_mpid) for PnP
         std::vector<cv::Point3f> p3d_pnp;
         std::vector<cv::Point2f> p2d_pnp;
         p3d_pnp.reserve(spRes_cur.numValid);
         p2d_pnp.reserve(spRes_cur.numValid);
-
+        std::vector<int> map_point_id;          //exp
+        std::vector<int> kp_index;              //exp
 
         int used3d = 0, skipped_no3d = 0;
         const auto kp2mp = kf_prev.kp_to_mpid;
         int n_prev = kf_prev.sp_res.numValid;
-        std::vector<int> map_point_id;          //exp
-        std::vector<int> kp_index;              //exp
 
-
+        int x = 0;
         for (int i = 0; i < n_prev; ++i) {
             int j = lgRes_prev_cur.matches0[i];
+            
             if (j < 0 || lgRes_prev_cur.mscores0[i] <= match_thr) continue;
 
 
             int mpid = (i < (int)kp2mp.size()) ? kp2mp[i] : -1;
-            if (mpid < 0) { skipped_no3d++; continue; }
+            if (mpid < 0) { 
+                skipped_no3d++; 
+                if(map_matches.count(j)){
+                    x++;
+                }
+                continue; 
+            }
 
 
             auto it = map.map_points.find(mpid);
@@ -444,7 +318,7 @@ int main() {
         }
         std::cout << "[PnP-Loop] Frame " << idx << ": 3D-2D for PnP = " << used3d
                 << " (no-3D=" << skipped_no3d << ")\n";
-
+        std::cout << "map_matches" << x << std::endl;
 
         if ((int)p3d_pnp.size() < 4) {
             std::cerr << "[PnP-Loop] Not enough 3D–2D; skipping frame " << idx << "\n";
@@ -458,7 +332,7 @@ int main() {
         cv::Mat distCoeffs = cv::Mat::zeros(4,1,CV_64F);
         bool ok_pnp = cv::solvePnPRansac(
             p3d_pnp, p2d_pnp, cameraMatrix, distCoeffs,
-            rvec, tvec, false, 1000, 1.8, 0.999, inliers_pnp, cv::USAC_MAGSAC
+            rvec, tvec, false, 1000, 1.8, 0.999, inliers_pnp, cv::SOLVEPNP_ITERATIVE
         );
         if (!ok_pnp || (int)inliers_pnp.size() < 4) {
             std::cerr << "[PnP-Loop] PnP failed/low inliers at frame " << idx << "\n";
@@ -527,7 +401,7 @@ int main() {
         auto [newPoints3D, newPairs] =
             slam_core::triangulate_and_filter_3d_points(R_prev, t_prev, R_cur, t_cur,
                                                         cameraMatrix, restPairs,
-                                                        /*maxZ*/ 100.0, /*minCosParallax*/ 0.1);
+                                                        /*maxZ*/ 100.0, /*minCosParallax*/ 0.3);
 
 
         std::cout << "[PnP-Loop] Frame " << idx << " triangulated-new = " << newPoints3D.size() << "\n";

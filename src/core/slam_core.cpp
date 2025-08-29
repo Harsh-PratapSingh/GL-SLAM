@@ -703,7 +703,122 @@ namespace slam_core {
 
     }
 
-    // std::vector<int> get_matches_from_previous_frames(Map& map, int& x, SuperPointTRT::Result& sp_res2){
+    std::unordered_map<int, SyntheticMatch> get_matches_from_previous_frames(
+        LightGlueTRT& lg,
+        Map& map,
+        int prev_frame_id,
+        int i,
+        cv::Mat& K,
+        SuperPointTRT::Result& sp_res2)
+    {
+        const int win = i;
+        const int min_kfid = std::max(0, prev_frame_id - win);
+        const int W = 1241, H = 376;
 
-    // }
-}
+        // Collect candidate mpids from recent keyframes
+        std::unordered_set<int> candidate_mpids;
+        for (int kfid = min_kfid; kfid < prev_frame_id; ++kfid) {
+            const auto& kf = map.keyframes[kfid];
+            for (int mpid : kf.kp_to_mpid)
+                if (mpid >= 0 && !map.map_points[mpid].is_bad) candidate_mpids.insert(mpid);
+        }
+        // Exclude those already seen in prev frame
+        for (int mpid : map.keyframes[prev_frame_id].kp_to_mpid)
+            if (mpid >= 0) candidate_mpids.erase(mpid);
+
+        std::cout << "Candidate mpid = " << candidate_mpids.size() << std::endl;
+
+        // Projection setup (world -> prev camera)
+        const auto& prev_kf = map.keyframes[prev_frame_id];
+        cv::Mat Rcw = prev_kf.R.t();
+        cv::Mat tcw = -Rcw * prev_kf.t;
+
+        const double fx = K.at<double>(0,0), cx = K.at<double>(0,2);
+        const double fy = K.at<double>(1,1), cy = K.at<double>(1,2);
+
+        std::vector<cv::Point2d> proj_uv;
+        std::vector<const float*> proj_desc_ptrs;
+        std::vector<int> mapid;
+        std::set<std::pair<int,int>> occupied_px;
+
+        proj_uv.reserve(candidate_mpids.size());
+        proj_desc_ptrs.reserve(candidate_mpids.size());
+        mapid.reserve(candidate_mpids.size());
+
+        for (int mpid : candidate_mpids) {
+            const auto& mp = map.map_points[mpid];
+
+            // Latest observation within [min_kfid, prev_frame_id)
+            int latest_kfid = -1, latest_kpidx = -1;
+            for (const auto& ob : mp.obs) {
+                if (ob.keyframe_id >= min_kfid && ob.keyframe_id < prev_frame_id) {
+                    if (ob.keyframe_id > latest_kfid) {
+                        latest_kfid = ob.keyframe_id;
+                        latest_kpidx = ob.kp_index;
+                    }
+                }
+            }
+            if (latest_kfid < 0 || latest_kpidx < 0) continue;
+
+            const auto& obs_kf = map.keyframes[latest_kfid];
+            const size_t desc_sz = obs_kf.sp_res.descriptors.size();
+            if ((latest_kpidx + 1) * 256 > desc_sz) continue;
+
+            const float* desc_ptr = obs_kf.sp_res.descriptors.data() + latest_kpidx * 256;
+
+            // Project into prev frame
+            cv::Mat Pw = (cv::Mat_<double>(3,1) << mp.position.x, mp.position.y, mp.position.z);
+            cv::Mat Pc = Rcw * Pw + tcw;
+            double Z = Pc.at<double>(2);
+            if (Z <= 0.0) continue;
+
+            double x = Pc.at<double>(0) / Z, y = Pc.at<double>(1) / Z;
+            double u = fx * x + cx, v = fy * y + cy;
+            if (u < 0 || u >= W || v < 0 || v >= H) continue;
+
+            auto pix = std::pair{(int)std::lround(u), (int)std::lround(v)};
+            if (!occupied_px.insert(pix).second) continue;
+
+            proj_uv.emplace_back(u, v);
+            proj_desc_ptrs.push_back(desc_ptr);
+            mapid.push_back(mpid);
+        }
+
+        std::cout << "proj_uv = " << proj_uv.size() << std::endl;
+
+        std::unordered_map<int, SyntheticMatch> SynMatches;
+        if (proj_uv.empty()) {
+            std::cout << "[Synthetic] No valid projected points to match." << std::endl;
+            return SynMatches;
+        }
+
+        // Build synthetic SuperPoint and match
+        SuperPointTRT::Result synth;
+        const int N = static_cast<int>(proj_uv.size());
+        synth.numValid = N;
+        synth.keypoints.resize(2 * N);
+        synth.scores.assign(N, 1.0f);
+        synth.descriptors.resize(256 * N);
+
+        for (int j = 0; j < N; ++j) {
+            synth.keypoints[2*j]     = static_cast<int64_t>(std::lround(proj_uv[j].x));
+            synth.keypoints[2*j + 1] = static_cast<int64_t>(std::lround(proj_uv[j].y));
+            std::copy(proj_desc_ptrs[j], proj_desc_ptrs[j] + 256, synth.descriptors.begin() + j * 256);
+        }
+
+        auto lgRes     = lg.run_Direct_Inference(synth, sp_res2);
+        auto lgMatches = slam_core::lightglue_score_filter(lgRes, 0.7f);
+
+        SynMatches.reserve(lgMatches.size());
+        for (const auto& m : lgMatches) {
+            if (m.idx1 >= 0 && m.idx0 >= 0 && m.idx0 < (int)mapid.size()) {
+                SynMatches[m.idx1] = SyntheticMatch{m.idx1, mapid[m.idx0]};
+                // SynMatches.push_back(SyntheticMatch{m.idx1, mapid[m.idx0]});
+            }
+        }
+
+        std::cout << "[Synthetic] proj=" << N << " matches=" << SynMatches.size() << std::endl;
+        return SynMatches;
+    }
+
+}   

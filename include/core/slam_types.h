@@ -59,6 +59,12 @@ struct Match2D2D {
     cv::Point2d p1;   // 2D point in frame1
 };
 
+//Match struct for when we match current frame with synthetic frame
+struct SyntheticMatch {
+    int idx_curr_frame;
+    int mpid;
+};
+
 
 //A bad visual slam is quite easy to implement. I give you a rough roadmap:
 
