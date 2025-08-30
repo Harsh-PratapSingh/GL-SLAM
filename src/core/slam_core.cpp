@@ -8,6 +8,10 @@
 #include <sstream>
 #include <fstream>
 #include <unordered_set>
+#include <memory> 
+
+#include <g2o/solvers/eigen/linear_solver_eigen.h> 
+#include <g2o/core/robust_kernel_impl.h> 
 
 namespace slam_core {
     // std::vector<cv::Point3f> triangulatePoints(const cv::Mat& K, const cv::Mat& R1, const cv::Mat& T1, 
@@ -704,13 +708,8 @@ namespace slam_core {
     }
 
     std::unordered_map<int, SyntheticMatch> get_matches_from_previous_frames(
-        LightGlueTRT& lg,
-        Map& map,
-        int prev_frame_id,
-        int i,
-        cv::Mat& K,
-        SuperPointTRT::Result& sp_res2,
-        float score)
+        LightGlueTRT& lg, Map& map, int prev_frame_id, int i, cv::Mat& K,
+        SuperPointTRT::Result& sp_res2, float score)
     {
         const int win = i;
         const int min_kfid = std::max(0, prev_frame_id - win);
@@ -826,7 +825,7 @@ namespace slam_core {
         std::vector<Match2D2D>, std::vector<int>, std::vector<int>, bool> 
         run_pnp(Map& map, SuperPointTRT& sp, LightGlueTRT& lg,
             std::string& img_dir_path, cv::Mat& cameraMatrix, float match_thr,
-            float map_match_thr, int idx, int window){
+            float map_match_thr, int idx, int window, bool get_inliner){
 
         int prev_kfid = map.next_keyframe_id - 1; 
         auto img_name = [](int idx) {
@@ -847,7 +846,7 @@ namespace slam_core {
         auto lgRes_prev_cur = lg.run_Direct_Inference(kf_prev.sp_res, spRes_cur);
         auto all_pairs = slam_core::lightglue_score_filter(lgRes_prev_cur, match_thr);
         auto map_matches = slam_core::get_matches_from_previous_frames(
-            lg, map, idx-1, window, cameraMatrix, spRes_cur, map_match_thr);
+            lg, map, prev_kfid, window, cameraMatrix, spRes_cur, map_match_thr);
         
         // 4) Build 3D–2D (from prev’s kp_to_mpid) for PnP
         std::vector<cv::Point3d> p3d_pnp;
@@ -895,23 +894,36 @@ namespace slam_core {
         }
 
         // 5) PnP (world->camera)
-        cv::Mat rvec, tvec, R_cur;
+        cv::Mat rvec, tvec, R_cur, t_cur;
         std::vector<int> inliers_pnp;
         cv::Mat distCoeffs = cv::Mat::zeros(4,1,CV_64F);
-        bool ok_pnp = cv::solvePnPRansac(
-            p3d_pnp, p2d_pnp, cameraMatrix, distCoeffs,
-            rvec, tvec, false, 1000, 1.8, 0.999, inliers_pnp, cv::USAC_MAGSAC
-        );
-        if (!ok_pnp || (int)inliers_pnp.size() < 4) {
-            std::cerr << "[PnP-Loop] PnP failed/low inliers at frame " << idx << "\n";
-            skip = true;
+        if(!skip){
+            bool ok_pnp = cv::solvePnPRansac(
+                p3d_pnp, p2d_pnp, cameraMatrix, distCoeffs,
+                rvec, tvec, false, 1000, 1.8, 0.999, inliers_pnp, cv::USAC_MAGSAC
+            );
+            if (!ok_pnp || (int)inliers_pnp.size() < 4) {
+                std::cerr << "[PnP-Loop] PnP failed/low inliers at frame " << idx << "\n";
+                skip = true;
+            }
+            if (get_inliner){
+                std::vector<int> mapid;
+                std::vector<int> keyid;
+                for (int idx : inliers_pnp) {
+                    mapid.push_back(map_point_id[idx]);
+                    keyid.push_back(kp_index[idx]);
+                }
+                map_point_id = mapid;
+                kp_index = keyid;
+            }
+            cv::Rodrigues(rvec, R_cur);
+            t_cur = tvec.clone(); 
+            R_cur.convertTo(R_cur, CV_64F);
+            t_cur.convertTo(t_cur, CV_64F);
+            R_cur = R_cur.t();
+            t_cur = -R_cur * t_cur;
         }
-        cv::Rodrigues(rvec, R_cur);
-        cv::Mat t_cur = tvec.clone(); 
-        R_cur.convertTo(R_cur, CV_64F);
-        t_cur.convertTo(t_cur, CV_64F);
-        R_cur = R_cur.t();
-        t_cur = -R_cur * t_cur;
+        
 
         // t_cur = slam_core::adjust_translation_magnitude(gtPoses, t_cur, idx );
 
@@ -919,8 +931,89 @@ namespace slam_core {
         std::cout << "[PnP-Loop] Matches without Map points = " << restPairs.size() << std::endl;
         std::cout << "[PnP-Loop] Frame " << idx << ": 3D-2D for PnP = " << used3d
                 << " (no-3D=" << skipped_no3d << ")\n";
-        std::cerr << "[PnP-Loop] PnP inliers at frame " << idx << " = " << (int)inliers_pnp.size() << "\n";
+        std::cerr << "[PnP-Loop] PnP inliers at frame " << idx << " = " << (int)inliers_pnp.size() << " , " << map_point_id.size()  << "\n";
 
         return std::make_tuple(img_cur, R_cur, t_cur, spRes_cur, restPairs, map_point_id, kp_index, skip);
     }   
+
+    // Function to refine pose with motion-only BA
+    void refine_pose_with_g2o(cv::Mat& R_cur, cv::Mat& t_cur, SuperPointTRT::Result& spRes_cur,
+                            std::vector<int>& map_point_id, std::vector<int>& kp_index,
+                            Map& map, cv::Mat& cameraMatrix) {
+        
+        // Setup optimizer
+        g2o::SparseOptimizer optimizer;
+        optimizer.setVerbose(false);
+        typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>> BlockSolverType;
+        typedef g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType> LinearSolverType;
+
+        auto linearSolver = std::make_unique<LinearSolverType>();
+        auto blockSolver = std::make_unique<BlockSolverType>(std::move(linearSolver));
+        auto algorithm = std::make_unique<g2o::OptimizationAlgorithmLevenberg>(std::move(blockSolver));
+        optimizer.setAlgorithm(algorithm.release());  // Transfer ownership to optimizer
+
+        // Add current pose vertex (optimizable)
+        g2o::VertexSE3Expmap* pose_vertex = new g2o::VertexSE3Expmap();
+        g2o::SE3Quat initial_pose;
+        Eigen::Matrix3d R_eig;
+        cv::cv2eigen(R_cur, R_eig);
+        Eigen::Vector3d t_eig;
+        cv::cv2eigen(t_cur, t_eig);
+        initial_pose = g2o::SE3Quat(R_eig, t_eig);
+        pose_vertex->setEstimate(initial_pose);
+        pose_vertex->setId(0);
+        pose_vertex->setFixed(false);
+        optimizer.addVertex(pose_vertex);
+
+        // Camera parameters
+        const double fx = cameraMatrix.at<double>(0, 0);
+        const double fy = cameraMatrix.at<double>(1, 1);
+        const double cx = cameraMatrix.at<double>(0, 2);
+        const double cy = cameraMatrix.at<double>(1, 2);
+        const double thHuber = sqrt(5.99);  // Chi-squared for 2 DoF at 95%
+
+        // Add edges (unary, only connected to pose; fixed points set via Xw)
+        for (size_t i = 0; i < kp_index.size(); ++i) {
+            int point_idx = map_point_id[i];
+            int kp_idx = kp_index[i];
+
+            // Get 3D point from map (adjust to your Map struct, e.g., if map.points is std::vector<cv::Point3f>)
+            cv::Point3f pt3d = map.map_points[point_idx].position;
+            Eigen::Vector3d point3d(pt3d.x, pt3d.y, pt3d.z);
+
+            // Get 2D observation
+            double x = spRes_cur.keypoints[2 * kp_idx];
+            double y = spRes_cur.keypoints[2 * kp_idx + 1];
+            Eigen::Vector2d obs(x, y);
+
+            // Add edge: optimizes only pose, with fixed point in Xw
+            g2o::EdgeSE3ProjectXYZOnlyPose* edge = new g2o::EdgeSE3ProjectXYZOnlyPose();
+            edge->setVertex(0, pose_vertex);
+            edge->setMeasurement(obs);
+            edge->setInformation(Eigen::Matrix2d::Identity());
+            edge->fx = fx;
+            edge->fy = fy;
+            edge->cx = cx;
+            edge->cy = cy;
+            edge->Xw = point3d;  // Fixed world point (no separate vertex needed)
+            edge->setRobustKernel(new g2o::RobustKernelHuber());
+            edge->robustKernel()->setDelta(thHuber);
+            optimizer.addEdge(edge);
+        }
+
+        // Optimize
+        optimizer.initializeOptimization();
+        optimizer.optimize(1000);  // Adjust iterations as needed
+
+        // Extract refined pose
+        g2o::SE3Quat refined_pose = pose_vertex->estimate();
+        Eigen::Matrix3d refined_R = refined_pose.rotation().toRotationMatrix();
+        Eigen::Vector3d refined_t = refined_pose.translation();
+        cv::eigen2cv(refined_R, R_cur);
+        cv::eigen2cv(refined_t, t_cur);
+
+        // No manual cleanup needed; optimizer handles algorithm
+
+    }
+
 }

@@ -21,6 +21,11 @@ namespace slam_visualization {
     //                            const cv::Mat& mask, int frame_idx,
     //                            const std::vector<cv::Point2f>& projected_points = {});
 
-    std::thread start_viewer(Map& map, std::mutex& map_mutex);
-    void request_shutdown();
+
+    static inline pangolin::OpenGlMatrix CvToGl(const cv::Mat& T);
+    
+    static inline cv::Mat GlToCv(const pangolin::OpenGlMatrix& M);
+
+    void visualize_map_loop(Map& map, std::mutex& map_mutex);
+    
 }
