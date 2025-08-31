@@ -78,7 +78,7 @@ namespace slam_core {
         std::vector<Match2D2D>, std::vector<int>, std::vector<int>, bool> 
         run_pnp(Map& map, SuperPointTRT& sp, LightGlueTRT& lg,
             std::string& img_dir_path, cv::Mat& cameraMatrix, float match_thr,
-            float map_match_thr, int idx, int window, bool get_inliner);
+            float map_match_thr, int idx, int window, bool get_inliner, std::vector<cv::Mat>& gtPoses);
 
 
     void refine_pose_with_g2o(cv::Mat& R_cur, cv::Mat& t_cur, SuperPointTRT::Result& spRes_cur,

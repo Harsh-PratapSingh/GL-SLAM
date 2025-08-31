@@ -27,7 +27,7 @@ const float match_thr = 0.7f;
 const float map_match_thr = 0.7f;
 const int map_match_window = 20;
 const float mag_filter = 0.01f;
-int max_idx   = 4000;           // max 4540
+int max_idx   = 200;           // max 4540
 
 Map map;
 std::mutex map_mutex;  // To synchronize map access
@@ -120,13 +120,16 @@ int main() {
         
         auto [img_cur, R_cur, t_cur, spRes_cur, restPairs, map_point_id,
             kp_index, skip] = slam_core::run_pnp(map, sp, lg, img_dir_path,
-            cameraMatrix, match_thr, map_match_thr, idx, map_match_window, true);
+            cameraMatrix, match_thr, map_match_thr, idx, map_match_window, true, gtPoses);
+
+        if(skip) continue;
 
         R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
         slam_core::refine_pose_with_g2o(R_cur, t_cur, spRes_cur, map_point_id, kp_index, map, cameraMatrix);
         R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
+        // t_cur = slam_core::adjust_translation_magnitude(gtPoses, t_cur, idx );
+
         
-        if(skip) continue;
         double t_mag = std::abs(cv::norm(map.keyframes[prev_kfid].t) - cv::norm(t_cur));
         if(t_mag < mag_filter) continue;
 

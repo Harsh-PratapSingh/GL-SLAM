@@ -825,7 +825,7 @@ namespace slam_core {
         std::vector<Match2D2D>, std::vector<int>, std::vector<int>, bool> 
         run_pnp(Map& map, SuperPointTRT& sp, LightGlueTRT& lg,
             std::string& img_dir_path, cv::Mat& cameraMatrix, float match_thr,
-            float map_match_thr, int idx, int window, bool get_inliner){
+            float map_match_thr, int idx, int window, bool get_inliner, std::vector<cv::Mat>& gtPoses){
 
         int prev_kfid = map.next_keyframe_id - 1; 
         auto img_name = [](int idx) {
@@ -900,7 +900,7 @@ namespace slam_core {
         if(!skip){
             bool ok_pnp = cv::solvePnPRansac(
                 p3d_pnp, p2d_pnp, cameraMatrix, distCoeffs,
-                rvec, tvec, false, 1000, 1.8, 0.999, inliers_pnp, cv::USAC_MAGSAC
+                rvec, tvec, false, 1000, 1.0, 0.999, inliers_pnp, cv::USAC_MAGSAC
             );
             if (!ok_pnp || (int)inliers_pnp.size() < 4) {
                 std::cerr << "[PnP-Loop] PnP failed/low inliers at frame " << idx << "\n";
@@ -978,7 +978,7 @@ namespace slam_core {
             int kp_idx = kp_index[i];
 
             // Get 3D point from map (adjust to your Map struct, e.g., if map.points is std::vector<cv::Point3f>)
-            cv::Point3f pt3d = map.map_points[point_idx].position;
+            cv::Point3d pt3d = map.map_points[point_idx].position;
             Eigen::Vector3d point3d(pt3d.x, pt3d.y, pt3d.z);
 
             // Get 2D observation
@@ -1003,7 +1003,7 @@ namespace slam_core {
 
         // Optimize
         optimizer.initializeOptimization();
-        optimizer.optimize(1000);  // Adjust iterations as needed
+        optimizer.optimize(20);  // Adjust iterations as needed
 
         // Extract refined pose
         g2o::SE3Quat refined_pose = pose_vertex->estimate();
