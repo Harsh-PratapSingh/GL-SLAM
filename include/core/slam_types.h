@@ -65,6 +65,11 @@ struct SyntheticMatch {
     int mpid;
 };
 
+struct OptimizedBAData {
+    std::vector<std::pair<int, cv::Mat>> optimized_poses;  // {kfid, 3x4 Rt (R|t)}
+    std::vector<std::pair<int, cv::Point3d>> optimized_points;  // {mpid, position}
+};
+
 
 //A bad visual slam is quite easy to implement. I give you a rough roadmap:
 

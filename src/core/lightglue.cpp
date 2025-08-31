@@ -201,7 +201,7 @@ bool LightGlueTRT::runInference(const std::vector<float>& kpts0, const std::vect
     return ok;
 }
 
-LightGlueTRT::Result LightGlueTRT::run_Direct_Inference(SuperPointTRT::Result& spRes0, SuperPointTRT::Result& spRes1){
+LightGlueTRT::Result LightGlueTRT::run_Direct_Inference(const SuperPointTRT::Result& spRes0, SuperPointTRT::Result& spRes1){
 
     Result out;
 

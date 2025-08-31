@@ -180,12 +180,16 @@ namespace slam_visualization {
 
                 for (const auto& kv : map.keyframes) {
                     const auto& kf = kv.second;
-                    cv::Mat Rcw = kf.R.t(), tcw = -Rcw * kf.t;
+                    cv::Mat Rcw = kf.R, tcw = kf.t;
                     cv::Mat T = cv::Mat::eye(4,4,CV_64F);
                     Rcw.copyTo(T(cv::Rect(0,0,3,3)));
                     tcw.copyTo(T(cv::Rect(3,0,1,3)));
 
                     float sz = 1.0f;
+                    if(kf.id == 0){
+                        sz = 2.0f;
+                    }
+                    
                     glLineWidth(3);
                     glBegin(GL_LINES);
                     double ox = T.at<double>(0,3), oy = T.at<double>(1,3), oz = T.at<double>(2,3);

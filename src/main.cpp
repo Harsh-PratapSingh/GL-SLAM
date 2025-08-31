@@ -25,9 +25,9 @@ constexpr int SYN_W = 1241;  // KITTI gray left image_0 width
 constexpr int SYN_H = 376;   // KITTI gray left image_0 height
 const float match_thr = 0.7f;
 const float map_match_thr = 0.7f;
-const int map_match_window = 20;
-const float mag_filter = 0.01f;
-int max_idx   = 200;           // max 4540
+const int map_match_window = 5;
+const float mag_filter = 0.00f;
+int max_idx   = 100;           // max 4540
 
 Map map;
 std::mutex map_mutex;  // To synchronize map access
@@ -64,6 +64,10 @@ static double rotationAngleErrorDeg(const cv::Mat& R_est, const cv::Mat& R_gt) {
     double tr = std::max(-1.0, std::min(1.0, (R_err.at<double>(0,0) + R_err.at<double>(1,1) + R_err.at<double>(2,2) - 1.0) * 0.5));
     return std::acos(tr) * 180.0 / CV_PI;
 }
+
+
+const int ba_window_size = 10;  // Adjust based on performance; e.g., 5-15
+
 
 int main() {
     SuperPointTRT sp;
@@ -103,10 +107,11 @@ int main() {
     // After initial map update (bootstrap)
     std::thread viewer_thread(slam_visualization::visualize_map_loop, std::ref(map), std::ref(map_mutex));
 
+    //std::this_thread::sleep_for(std::chrono::milliseconds(5000));
     // ===================== PnP on next image (temp5.png) =====================
 
     
-    int start_idx = map.next_keyframe_id;            
+    const int start_idx = map.next_keyframe_id;            
     
     // auto img_name = [](int idx) {
     //         char buf[32];
@@ -115,23 +120,25 @@ int main() {
     //     };
 
     for (int idx = start_idx; idx <= max_idx; ++idx) {
-    
-        int prev_kfid = map.next_keyframe_id - 1; 
-        
+        const int prev_kfid = map.next_keyframe_id - 1; 
+   
         auto [img_cur, R_cur, t_cur, spRes_cur, restPairs, map_point_id,
-            kp_index, skip] = slam_core::run_pnp(map, sp, lg, img_dir_path,
-            cameraMatrix, match_thr, map_match_thr, idx, map_match_window, true, gtPoses);
-
+                kp_index, skip] = slam_core::run_pnp(map, sp, lg, img_dir_path,
+                cameraMatrix, match_thr, map_match_thr, idx, map_match_window, false, gtPoses);
         if(skip) continue;
 
-        R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
-        slam_core::refine_pose_with_g2o(R_cur, t_cur, spRes_cur, map_point_id, kp_index, map, cameraMatrix);
-        R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
+        // R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
+        //slam_core::refine_pose_with_g2o(R_cur, t_cur, spRes_cur, map_point_id, kp_index, map, cameraMatrix);
+        // R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
         // t_cur = slam_core::adjust_translation_magnitude(gtPoses, t_cur, idx );
 
         
         double t_mag = std::abs(cv::norm(map.keyframes[prev_kfid].t) - cv::norm(t_cur));
         if(t_mag < mag_filter) continue;
+
+        cv::Mat Rc = R_cur.clone(); cv::Mat tc = t_cur.clone();
+        Rc = Rc.t();
+        tc = -Rc * tc;
 
         // Compare with GT
         if (gtPoses.size() > idx) {
@@ -139,21 +146,20 @@ int main() {
             cv::Mat R_gt = T_wi(cv::Rect(0,0,3,3)).clone();
             cv::Mat t_gt = T_wi(cv::Rect(3,0,1,3)).clone();
 
-            double rot_err = rotationAngleErrorDeg(R_cur, R_gt);
-            double t_dir_err = angleBetweenVectorsDeg(t_cur, t_gt);
-            double t_mag_err = std::abs(cv::norm(t_cur) - cv::norm(t_gt));
+            double rot_err = rotationAngleErrorDeg(Rc, R_gt);
+            double t_dir_err = angleBetweenVectorsDeg(tc, t_gt);
+            double t_mag_err = std::abs(cv::norm(tc) - cv::norm(t_gt));
             std::cout << "[PnP-Loop] Frame " << idx << " | rot(deg): " << rot_err
                     << " t_dir(deg): " << t_dir_err << " t_mag(m): " << t_mag_err << "\n";
         }
 
-        cv::Mat R_prev = map.keyframes[prev_kfid].R; cv::Mat t_prev = map.keyframes[prev_kfid].t;
+        cv::Mat R_prev = map.keyframes[prev_kfid].R.clone(); cv::Mat t_prev = map.keyframes[prev_kfid].t.clone();
         R_prev = R_prev.t(); t_prev = -R_prev * t_prev;
-        R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
+        // R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
 
         auto [newPoints3D, newPairs] = slam_core::triangulate_and_filter_3d_points(
             R_prev, t_prev, R_cur, t_cur, cameraMatrix, restPairs,
             /*maxZ*/ 100.0, /*min_repoj_error*/ 0.1);
-
         std::cout << "[PnP-Loop] Frame " << idx << " triangulated-new = " << newPoints3D.size() << "\n";
 
         {
@@ -176,9 +182,29 @@ int main() {
         }
         
         // In your loop, after run_pnp and skip/mag_filter checks
+        // Perform BA outside lock
+        OptimizedBAData opt_data;
+        if (map.next_keyframe_id >= ba_window_size) {
+            opt_data = slam_core::perform_local_ba(map, cameraMatrix, ba_window_size, map.next_keyframe_id - 1);
+        }
+
+        // Lock only for update
+        if (!opt_data.optimized_poses.empty()) {
+            std::lock_guard<std::mutex> lock(map_mutex);
+            for (const auto& [kfid, Rt] : opt_data.optimized_poses) {
+                if (map.keyframes.find(kfid) != map.keyframes.end()) {
+                    map.keyframes[kfid].R = Rt.colRange(0, 3).clone();
+                    map.keyframes[kfid].t = Rt.col(3).clone();
+                }
+            }
+            for (const auto& [pid, pos] : opt_data.optimized_points) {
+                if (map.map_points.find(pid) != map.map_points.end()) {
+                    map.map_points[pid].position = pos;
+                }
+            }
+        }
+
         
-
-
         // {   
         //     std::this_thread::sleep_for(std::chrono::milliseconds(5000));
         //     // std::lock_guard<std::mutex> lock(map_mutex);
@@ -208,6 +234,95 @@ int main() {
         cv::imshow("Inliers on Second Image", img1_color);
         cv::waitKey(1);
     }
+    
+    // After the main loop, analyze map points
+    {
+        // std::lock_guard<std::mutex> lock(map_mutex);  // Ensure thread-safe access
+
+        int count_low_error_high_obs = 0;
+        int count_low_error_low_obs = 0;
+        int count_high_error_high_obs = 0;
+        int count_high_error_low_obs = 0;
+
+        const double error_threshold = 3.0;  // Pixels
+        const int obs_threshold = 3;
+
+        for (const auto& [point_id, point] : map.map_points) {
+            if (point.obs.empty() || point.is_bad) continue;
+
+            // Count observations
+            int num_obs = point.obs.size();
+
+            // Compute average reprojection error
+            double total_error = 0.0;
+            int valid_obs = 0;
+            cv::Mat position_mat = (cv::Mat_<double>(3,1) << point.position.x, point.position.y, point.position.z);
+
+            for (const auto& obs : point.obs) {
+                int kfid = obs.keyframe_id;
+                if (map.keyframes.find(kfid) == map.keyframes.end()) continue;
+
+                const auto& kf = map.keyframes.at(kfid);
+                
+                cv::Mat R1 = kf.R.clone();
+                cv::Mat t1 = kf.t.clone();
+                R1 = R1.t();
+                t1 = -R1 * t1;
+                // Project 3D point to camera coordinates (assuming R/t are camera-to-world)
+                cv::Mat camera_point = R1 * position_mat + t1;
+                if (camera_point.at<double>(2) <= 0) continue;  // Behind camera
+
+                // Normalize
+                double z = camera_point.at<double>(2);
+                cv::Mat normalized = (cv::Mat_<double>(3,1) << camera_point.at<double>(0)/z, camera_point.at<double>(1)/z, 1.0);
+
+                // Apply camera matrix for pixel coordinates
+                cv::Mat projected_mat = cameraMatrix * normalized;
+                cv::Point2d projected(projected_mat.at<double>(0), projected_mat.at<double>(1));
+
+                // Reprojection error
+                double error = cv::norm(projected - obs.point2D);
+                
+                //std::cout << "Error " << valid_obs << " : " << error << std::endl;
+                total_error += error;
+                valid_obs++;
+            }
+
+            if (valid_obs == 0) continue;
+
+            double avg_error = total_error / valid_obs;
+
+            // Categorize
+            bool is_low_error = (avg_error < error_threshold);
+            bool is_high_obs = (num_obs >= obs_threshold);
+
+            if (is_low_error && is_high_obs) {
+                count_low_error_high_obs++;
+            } else if (is_low_error && !is_high_obs) {
+                count_low_error_low_obs++;
+            } else if (!is_low_error && is_high_obs) {
+                count_high_error_high_obs++;
+            } else {
+                count_high_error_low_obs++;
+            }
+        }
+
+        // Print counts
+        std::cout << "Map Point Analysis:" << std::endl;
+        std::cout << " - Low error (< " << error_threshold << " px) + High obs (>= " << obs_threshold << "): " << count_low_error_high_obs << std::endl;
+        std::cout << " - Low error (< " << error_threshold << " px) + Low obs (< " << obs_threshold << "): " << count_low_error_low_obs << std::endl;
+        std::cout << " - High error (>= " << error_threshold << " px) + High obs (>= " << obs_threshold << "): " << count_high_error_high_obs << std::endl;
+        std::cout << " - High error (>= " << error_threshold << " px) + Low obs (< " << obs_threshold << "): " << count_high_error_low_obs << std::endl;
+        std::cout << "Total map points analyzed: " << map.map_points.size() << std::endl;
+
+        std::cout << "Frame 0 :-" << std::endl;
+        std::cout << " R : " << map.keyframes[0].R << std::endl;
+        std::cout << " t : " << map.keyframes[0].t << std::endl;
+        std::cout << "Frame 1 :-" << std::endl;
+        std::cout << " R : " << map.keyframes[1].R << std::endl;
+        std::cout << " t : " << map.keyframes[1].t << std::endl;
+    }
+
 
     viewer_thread.join();
 

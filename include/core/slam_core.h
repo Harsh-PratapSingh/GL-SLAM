@@ -84,4 +84,7 @@ namespace slam_core {
     void refine_pose_with_g2o(cv::Mat& R_cur, cv::Mat& t_cur, SuperPointTRT::Result& spRes_cur,
                             std::vector<int>& map_point_id, std::vector<int>& kp_index,
                             Map& map, cv::Mat& cameraMatrix) ;
+
+    OptimizedBAData perform_local_ba(const Map& map, const cv::Mat& cameraMatrix, int window_size, int current_kfid);
+
 }

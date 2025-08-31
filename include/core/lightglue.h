@@ -41,7 +41,7 @@ public:
                       int N0, int N1,
                       Result& out);
 
-    LightGlueTRT::Result run_Direct_Inference(SuperPointTRT::Result& spRes0, SuperPointTRT::Result& spRes1);
+    LightGlueTRT::Result run_Direct_Inference(const SuperPointTRT::Result& spRes0, SuperPointTRT::Result& spRes1);
 
     // Optional: change workspace cap (default 1GB) before init
     void setWorkspaceSizeBytes(size_t bytes);
