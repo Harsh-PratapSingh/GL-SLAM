@@ -27,7 +27,7 @@ const float match_thr = 0.7f;
 const float map_match_thr = 0.7f;
 const int map_match_window = 5;
 const float mag_filter = 0.00f;
-int max_idx   = 100;           // max 4540
+int max_idx   = 1;           // max 4540
 
 Map map;
 std::mutex map_mutex;  // To synchronize map access
@@ -66,7 +66,7 @@ static double rotationAngleErrorDeg(const cv::Mat& R_est, const cv::Mat& R_gt) {
 }
 
 
-const int ba_window_size = 10;  // Adjust based on performance; e.g., 5-15
+const int ba_window_size = 2;  // Adjust based on performance; e.g., 5-15
 
 
 int main() {
@@ -107,6 +107,26 @@ int main() {
     // After initial map update (bootstrap)
     std::thread viewer_thread(slam_visualization::visualize_map_loop, std::ref(map), std::ref(map_mutex));
 
+    OptimizedBAData opt_data;
+    if (map.next_keyframe_id >= ba_window_size) {
+        opt_data = slam_core::perform_local_ba(map, cameraMatrix, ba_window_size, map.next_keyframe_id - 1);
+    }
+
+    // // Lock only for update
+    if (!opt_data.optimized_poses.empty()) {
+        std::lock_guard<std::mutex> lock(map_mutex);
+        for (const auto& [kfid, Rt] : opt_data.optimized_poses) {
+            if (map.keyframes.find(kfid) != map.keyframes.end()) {
+                map.keyframes[kfid].R = Rt.colRange(0, 3).clone();
+                map.keyframes[kfid].t = Rt.col(3).clone();
+            }
+        }
+        for (const auto& [pid, pos] : opt_data.optimized_points) {
+            if (map.map_points.find(pid) != map.map_points.end()) {
+                map.map_points[pid].position = pos;
+            }
+        }
+    }
     //std::this_thread::sleep_for(std::chrono::milliseconds(5000));
     // ===================== PnP on next image (temp5.png) =====================
 
