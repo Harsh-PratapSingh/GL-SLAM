@@ -11,7 +11,9 @@ set(Pangolin_DIR ${CMAKE_SOURCE_DIR}/third_party/Pangolin/install/lib/cmake/Pang
 find_package(Pangolin REQUIRED)
 set(g2o_DIR ${CMAKE_SOURCE_DIR}/third_party/g2o/install/lib/cmake/g2o)
 find_package(g2o REQUIRED)
-
+set(Ceres_DIR ${CMAKE_SOURCE_DIR}/third_party/ceres/lib/cmake/Ceres)
+find_package(Ceres REQUIRED)
+# find_package(Ceres REQUIRED COMPONENTS SuiteSparse)
 
 include_directories(
     /usr/include/x86_64-linux-gnu
@@ -21,6 +23,7 @@ include_directories(
     ${Pangolin_INCLUDE_DIRS}
     ${g2o_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/include
+    ${Ceres_INCLUDE_DIRS}
 )
 
 link_directories(
@@ -29,6 +32,8 @@ link_directories(
     ${OpenCV_LIBRARY_DIRS}
     ${g2o_LIBRARY_DIRS}
     ${Pangolin_LIBRARY_DIRS}
+    ${Ceres_LIBRARY_DIRS}
+
     
 )
 
@@ -62,6 +67,7 @@ target_include_directories(core PUBLIC
     ${Pangolin_INCLUDE_DIRS}
     ${g2o_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
+    ${Ceres_INCLUDE_DIRS}
 )
 target_link_libraries(core
     nvinfer
@@ -76,6 +82,7 @@ target_link_libraries(core
     ${Pangolin_LIBRARIES}
     ${EIGEN3_LIBS}
     g2o::core g2o::stuff g2o::types_sba g2o::solver_eigen g2o::opengl_helper
+    Ceres::ceres
 )
 
 
