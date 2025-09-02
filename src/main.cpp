@@ -24,7 +24,7 @@
 constexpr int SYN_W = 1241;  // KITTI gray left image_0 width
 constexpr int SYN_H = 376;   // KITTI gray left image_0 height
 const float match_thr = 0.7f;
-const float map_match_thr = 0.7f;
+const float map_match_thr = 1.0f;
 const int map_match_window = 5;
 const float mag_filter = 0.00f;
 int max_idx   = 1;           // max 4540
@@ -66,7 +66,103 @@ static double rotationAngleErrorDeg(const cv::Mat& R_est, const cv::Mat& R_gt) {
 }
 
 
-const int ba_window_size = 2;  // Adjust based on performance; e.g., 5-15
+#include <ceres/ceres.h>
+#include <ceres/rotation.h>
+
+// ... (rest of your existing includes and code)
+int stop = 0;
+// Define the reprojection error cost function
+// Define the reprojection error cost function
+struct ReprojectionError {
+    ReprojectionError(const cv::Point2d& observed, const cv::Mat& camera_matrix)
+        : observed_(observed), camera_matrix_(camera_matrix) {}
+
+    template <typename T>
+    bool operator()(const T* const camera,  // 6 params: angle-axis rotation + translation
+                    const T* const point,   // 3 params: 3D point
+                    T* residuals) const {
+        // Camera params: camera[0,1,2] = angle-axis rotation, camera[3,4,5] = translation
+        // Assuming pose is camera-to-world: invert to get world-to-camera
+        T p_trans[3];
+        p_trans[0] = point[0] - camera[3];
+        p_trans[1] = point[1] - camera[4];
+        p_trans[2] = point[2] - camera[5];
+
+        // Apply inverse rotation (transpose, i.e., rotate by -angle_axis)
+        T minus_camera[3] = { -camera[0], -camera[1], -camera[2] };
+        T p[3];
+        ceres::AngleAxisRotatePoint(minus_camera, p_trans, p);
+
+        // Project to normalized image coordinates
+        T xp = p[0] / p[2];
+        T yp = p[1] / p[2];
+
+        // Apply camera matrix (fx, fy, cx, cy; assuming no skew or distortion)
+        T fx = T(camera_matrix_.at<double>(0, 0));
+        T fy = T(camera_matrix_.at<double>(1, 1));
+        T cx = T(camera_matrix_.at<double>(0, 2));
+        T cy = T(camera_matrix_.at<double>(1, 2));
+
+        T predicted_x = fx * xp + cx;
+        T predicted_y = fy * yp + cy;
+
+        // Residuals
+        residuals[0] = predicted_x - T(observed_.x);
+        residuals[1] = predicted_y - T(observed_.y);
+
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Point2d& observed, const cv::Mat& camera_matrix) {
+        return new ceres::AutoDiffCostFunction<ReprojectionError, 2, 6, 3>(
+            new ReprojectionError(observed, camera_matrix));
+    }
+
+    cv::Point2d observed_;
+    cv::Mat camera_matrix_;
+};
+
+
+// Function to compute average reprojection error (extracted from your existing code)
+double ComputeAverageReprojectionError(const Map& map, const cv::Mat& cameraMatrix) {
+    double total_error = 0.0;
+    int valid_obs = 0;
+
+    for (const auto& [point_id, point] : map.map_points) {
+        if (point.obs.empty() || point.is_bad) continue;
+
+        cv::Mat position_mat = (cv::Mat_<double>(3,1) << point.position.x, point.position.y, point.position.z);
+
+        for (const auto& obs : point.obs) {
+            int kfid = obs.keyframe_id;
+            if (map.keyframes.find(kfid) == map.keyframes.end()) continue;
+            const auto& kf = map.keyframes.at(kfid);
+
+            cv::Mat R1 = kf.R.clone();
+            cv::Mat t1 = kf.t.clone();
+            R1 = R1.t();
+            t1 = -R1 * t1;
+
+            cv::Mat camera_point = R1 * position_mat + t1;
+            if (camera_point.at<double>(2) <= 0) continue;
+
+            double z = camera_point.at<double>(2);
+            cv::Mat normalized = (cv::Mat_<double>(3,1) << camera_point.at<double>(0)/z, camera_point.at<double>(1)/z, 1.0);
+
+            cv::Mat projected_mat = cameraMatrix * normalized;
+            cv::Point2d projected(projected_mat.at<double>(0), projected_mat.at<double>(1));
+
+            double error = cv::norm(projected - obs.point2D);
+            total_error += error;
+            valid_obs++;
+        }
+    }
+
+    if (valid_obs == 0) return 0.0;
+    return total_error / valid_obs;
+}
+
+const int ba_window_size = 3;  // Adjust based on performance; e.g., 5-15
 
 
 int main() {
@@ -107,26 +203,7 @@ int main() {
     // After initial map update (bootstrap)
     std::thread viewer_thread(slam_visualization::visualize_map_loop, std::ref(map), std::ref(map_mutex));
 
-    OptimizedBAData opt_data;
-    if (map.next_keyframe_id >= ba_window_size) {
-        opt_data = slam_core::perform_local_ba(map, cameraMatrix, ba_window_size, map.next_keyframe_id - 1);
-    }
 
-    // // Lock only for update
-    if (!opt_data.optimized_poses.empty()) {
-        std::lock_guard<std::mutex> lock(map_mutex);
-        for (const auto& [kfid, Rt] : opt_data.optimized_poses) {
-            if (map.keyframes.find(kfid) != map.keyframes.end()) {
-                map.keyframes[kfid].R = Rt.colRange(0, 3).clone();
-                map.keyframes[kfid].t = Rt.col(3).clone();
-            }
-        }
-        for (const auto& [pid, pos] : opt_data.optimized_points) {
-            if (map.map_points.find(pid) != map.map_points.end()) {
-                map.map_points[pid].position = pos;
-            }
-        }
-    }
     //std::this_thread::sleep_for(std::chrono::milliseconds(5000));
     // ===================== PnP on next image (temp5.png) =====================
 
@@ -201,29 +278,7 @@ int main() {
             );
         }
         
-        // In your loop, after run_pnp and skip/mag_filter checks
-        // Perform BA outside lock
-        OptimizedBAData opt_data;
-        if (map.next_keyframe_id >= ba_window_size) {
-            opt_data = slam_core::perform_local_ba(map, cameraMatrix, ba_window_size, map.next_keyframe_id - 1);
-        }
-
-        // Lock only for update
-        if (!opt_data.optimized_poses.empty()) {
-            std::lock_guard<std::mutex> lock(map_mutex);
-            for (const auto& [kfid, Rt] : opt_data.optimized_poses) {
-                if (map.keyframes.find(kfid) != map.keyframes.end()) {
-                    map.keyframes[kfid].R = Rt.colRange(0, 3).clone();
-                    map.keyframes[kfid].t = Rt.col(3).clone();
-                }
-            }
-            for (const auto& [pid, pos] : opt_data.optimized_points) {
-                if (map.map_points.find(pid) != map.map_points.end()) {
-                    map.map_points[pid].position = pos;
-                }
-            }
-        }
-
+        // In main(), after the for loop (before the existing map point analysis)
         
         // {   
         //     std::this_thread::sleep_for(std::chrono::milliseconds(5000));
@@ -232,7 +287,7 @@ int main() {
         //     // map.keyframes[map.next_keyframe_id-1].t = t_cur;
         // }
        
-
+        
 
         //visualize obs(green) and new points(blue)
         cv::Mat img1_color;
@@ -254,7 +309,268 @@ int main() {
         cv::imshow("Inliers on Second Image", img1_color);
         cv::waitKey(1);
     }
+
     
+    {
+
+        // Compute average reprojection error before BA
+        double avg_error_before = ComputeAverageReprojectionError(map, cameraMatrix);
+        std::cout << "Average Reprojection Error Before BA: " << avg_error_before << " px" << std::endl;
+
+        // Prepare parameters for Ceres
+        // We need arrays for camera parameters (6 per keyframe: angle-axis rot + trans) and points (3 per point)
+        std::vector<double> camera_params;
+        std::vector<double> point_params;
+
+        // Map from keyframe id to parameter index
+        std::unordered_map<int, int> kf_to_param_idx;
+        int cam_param_size = 6;  // angle-axis (3) + translation (3)
+
+        // Collect and convert camera poses
+        std::unique_lock<std::mutex> lock(map_mutex);
+        for (const auto& [kfid, kf] : map.keyframes) {
+            kf_to_param_idx[kfid] = camera_params.size() / cam_param_size;
+
+            cv::Mat Rr = kf.R;
+            cv::Mat Tr = kf.t;
+
+            // Rr = Rr.t();
+            // Tr = -Rr * Tr;
+            // Convert rotation matrix to angle-axis
+            cv::Mat angle_axis;
+            cv::Rodrigues(Rr, angle_axis);  // Assuming R is camera-to-world; adjust if needed
+
+            camera_params.push_back(angle_axis.at<double>(0));
+            camera_params.push_back(angle_axis.at<double>(1));
+            camera_params.push_back(angle_axis.at<double>(2));
+            camera_params.push_back(Tr.at<double>(0));
+            camera_params.push_back(Tr.at<double>(1));
+            camera_params.push_back(Tr.at<double>(2));
+        }
+
+        // Collect points
+        std::unordered_map<int, int> point_to_param_idx;
+        int point_param_size = 3;
+        for (const auto& [point_id, point] : map.map_points) {
+            if (point.is_bad || point.obs.empty()) continue;
+            point_to_param_idx[point_id] = point_params.size() / point_param_size;
+
+            point_params.push_back(point.position.x);
+            point_params.push_back(point.position.y);
+            point_params.push_back(point.position.z);
+        }
+
+        // Build the problem
+        ceres::Problem problem;
+
+        for (const auto& [point_id, point] : map.map_points) {
+            if (point.is_bad || point.obs.empty()) continue;
+            int point_idx = point_to_param_idx[point_id];
+
+            for (const auto& obs : point.obs) {
+                int kfid = obs.keyframe_id;
+                if (map.keyframes.find(kfid) == map.keyframes.end()) continue;
+
+                int cam_idx = kf_to_param_idx[kfid];
+
+                ceres::CostFunction* cost_function = ReprojectionError::Create(obs.point2D, cameraMatrix);
+                ceres::LossFunction* loss_function = new ceres::HuberLoss(0.1);  // Scale 1.0; adjust based on expected error magnitude (e.g., pixels)
+                problem.AddResidualBlock(cost_function, loss_function,
+                                        &camera_params[cam_idx * cam_param_size],
+                                        &point_params[point_idx * point_param_size]);
+            }
+        }
+
+        // Fix the first camera to remove gauge freedom
+        if (!map.keyframes.empty()) {
+            int first_kf_id = map.keyframes.begin()->first;
+            int first_cam_idx = kf_to_param_idx[first_kf_id];
+            problem.SetParameterBlockConstant(&camera_params[first_cam_idx * cam_param_size]);
+        }
+
+        {
+            const int anchor_kf_id = 0; // known bootstrap keyframe
+            const int cam_param_size = 6;
+            const int anchor_cam_idx = kf_to_param_idx.at(anchor_kf_id);
+            problem.SetParameterBlockConstant(&camera_params[anchor_cam_idx * cam_param_size]);
+            // If only translation should be fixed, use SubsetParameterization instead:
+            // std::vector<int> fixed = {3,4,5};
+            // auto* subset = new ceres::SubsetParameterization(6, fixed);
+            // problem.SetParameterization(&camera_params[anchor_cam_idx * cam_param_size], subset);
+        }
+        lock.unlock();
+
+        // Solve
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::SPARSE_SCHUR;  // Or SPARSE_SCHUR for larger problems
+        options.minimizer_progress_to_stdout = true;
+        options.max_num_iterations = 300; // increase from default ~50
+        options.num_threads = 8;  // Adjust to your CPU cores (e.g., std::thread::hardware_concurrency())
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+        std::cout << summary.FullReport() << std::endl;
+
+
+        std::lock_guard<std::mutex> lk(map_mutex);
+        // Update the map with optimized values
+        // Update cameras
+        for (const auto& [kfid, idx] : kf_to_param_idx) {
+            double* cam = &camera_params[idx * cam_param_size];
+            // cv::Mat Rr = (cv::Mat_<double>(3,1) << cam[0], cam[1], cam[2]);
+            // cv::Mat Tr = (cv::Mat_<double>(3,1) << cam[3], cam[4], cam[5]);
+
+            // Rr = Rr.t();
+            // Tr = -Rr * Tr;
+            
+            // cv::Rodrigues(Rr, map.keyframes[kfid].R);
+            // map.keyframes[kfid].t = Tr;
+            cv::Mat angle_axis = (cv::Mat_<double>(3,1) << cam[0], cam[1], cam[2]);
+
+            cv::Rodrigues(angle_axis, map.keyframes[kfid].R);
+            map.keyframes[kfid].t = (cv::Mat_<double>(3,1) << cam[3], cam[4], cam[5]);
+            // map.keyframes[kfid].R = map.keyframes[kfid].R.t();
+            // map.keyframes[kfid].t = -map.keyframes[kfid].R * map.keyframes[kfid].t;
+        }
+
+        // Update points
+        for (const auto& [point_id, idx] : point_to_param_idx) {
+            double* pt = &point_params[idx * point_param_size];
+            map.map_points[point_id].position = cv::Point3d(pt[0], pt[1], pt[2]);
+        }
+        
+
+        // Compute average reprojection error after BA
+        double avg_error_after = ComputeAverageReprojectionError(map, cameraMatrix);
+        std::cout << "Average Reprojection Error After BA: " << avg_error_after << " px" << std::endl;
+    }
+    // // In main(), after the for loop (before the existing map point analysis)
+    // {
+    //     std::lock_guard<std::mutex> lock(map_mutex);
+
+    //     // Compute average reprojection error before BA
+    //     double avg_error_before = ComputeAverageReprojectionError(map, cameraMatrix);
+    //     std::cout << "Average Reprojection Error Before BA: " << avg_error_before << " px" << std::endl;
+
+    //     // Prepare parameters for Ceres
+    //     // We need arrays for camera parameters (6 per keyframe: angle-axis rot + trans) and points (3 per point)
+    //     std::vector<double> camera_params;
+    //     std::vector<double> point_params;
+
+    //     // Map from keyframe id to parameter index
+    //     std::unordered_map<int, int> kf_to_param_idx;
+    //     int cam_param_size = 6;  // angle-axis (3) + translation (3)
+
+    //     // Collect and convert camera poses
+    //     for (const auto& [kfid, kf] : map.keyframes) {
+    //         kf_to_param_idx[kfid] = camera_params.size() / cam_param_size;
+
+    //         cv::Mat Rr = kf.R;
+    //         cv::Mat Tr = kf.t;
+
+    //         Rr = Rr.t();
+    //         Tr = -Rr * Tr;
+    //         // Convert rotation matrix to angle-axis
+    //         cv::Mat angle_axis;
+    //         cv::Rodrigues(Rr, angle_axis);  // Assuming R is camera-to-world; adjust if needed
+
+    //         camera_params.push_back(angle_axis.at<double>(0));
+    //         camera_params.push_back(angle_axis.at<double>(1));
+    //         camera_params.push_back(angle_axis.at<double>(2));
+    //         camera_params.push_back(Tr.at<double>(0));
+    //         camera_params.push_back(Tr.at<double>(1));
+    //         camera_params.push_back(Tr.at<double>(2));
+    //     }
+
+    //     // Collect points
+    //     std::unordered_map<int, int> point_to_param_idx;
+    //     int point_param_size = 3;
+    //     for (const auto& [point_id, point] : map.map_points) {
+    //         if (point.is_bad || point.obs.empty()) continue;
+    //         point_to_param_idx[point_id] = point_params.size() / point_param_size;
+
+    //         point_params.push_back(point.position.x);
+    //         point_params.push_back(point.position.y);
+    //         point_params.push_back(point.position.z);
+    //     }
+
+    //     // Build the problem
+    //     ceres::Problem problem;
+
+    //     for (const auto& [point_id, point] : map.map_points) {
+    //         if (point.is_bad || point.obs.empty()) continue;
+    //         int point_idx = point_to_param_idx[point_id];
+
+    //         for (const auto& obs : point.obs) {
+    //             int kfid = obs.keyframe_id;
+    //             if (map.keyframes.find(kfid) == map.keyframes.end()) continue;
+
+    //             int cam_idx = kf_to_param_idx[kfid];
+
+    //             ceres::CostFunction* cost_function = ReprojectionError::Create(obs.point2D, cameraMatrix);
+    //             problem.AddResidualBlock(cost_function, nullptr,
+    //                                     &camera_params[cam_idx * cam_param_size],
+    //                                     &point_params[point_idx * point_param_size]);
+    //         }
+    //     }
+
+    //     // Fix the first camera to remove gauge freedom
+    //     if (!map.keyframes.empty()) {
+    //         int first_kf_id = map.keyframes.begin()->first;
+    //         int first_cam_idx = kf_to_param_idx[first_kf_id];
+    //         problem.SetParameterBlockConstant(&camera_params[first_cam_idx * cam_param_size]);
+    //     }
+
+    //     {
+    //         const int anchor_kf_id = 0; // known bootstrap keyframe
+    //         const int cam_param_size = 6;
+    //         const int anchor_cam_idx = kf_to_param_idx.at(anchor_kf_id);
+    //         problem.SetParameterBlockConstant(&camera_params[anchor_cam_idx * cam_param_size]);
+    //         // If only translation should be fixed, use SubsetParameterization instead:
+    //         // std::vector<int> fixed = {3,4,5};
+    //         // auto* subset = new ceres::SubsetParameterization(6, fixed);
+    //         // problem.SetParameterization(&camera_params[anchor_cam_idx * cam_param_size], subset);
+    //     }
+
+    //     // Solve
+    //     ceres::Solver::Options options;
+    //     options.linear_solver_type = ceres::SPARSE_SCHUR;  // Or SPARSE_SCHUR for larger problems
+    //     options.minimizer_progress_to_stdout = true;
+    //     options.max_num_iterations = 50; // increase from default ~50
+    //     ceres::Solver::Summary summary;
+    //     ceres::Solve(options, &problem, &summary);
+    //     std::cout << summary.FullReport() << std::endl;
+
+    //     // Update the map with optimized values
+    //     // Update cameras
+    //     for (const auto& [kfid, idx] : kf_to_param_idx) {
+    //         double* cam = &camera_params[idx * cam_param_size];
+    //         // cv::Mat Rr = (cv::Mat_<double>(3,1) << cam[0], cam[1], cam[2]);
+    //         // cv::Mat Tr = (cv::Mat_<double>(3,1) << cam[3], cam[4], cam[5]);
+
+    //         // Rr = Rr.t();
+    //         // Tr = -Rr * Tr;
+            
+    //         // cv::Rodrigues(Rr, map.keyframes[kfid].R);
+    //         // map.keyframes[kfid].t = Tr;
+    //         cv::Mat angle_axis = (cv::Mat_<double>(3,1) << cam[0], cam[1], cam[2]);
+
+    //         cv::Rodrigues(angle_axis, map.keyframes[kfid].R);
+    //         map.keyframes[kfid].t = (cv::Mat_<double>(3,1) << cam[3], cam[4], cam[5]);
+    //         map.keyframes[kfid].R = map.keyframes[kfid].R.t();
+    //         map.keyframes[kfid].t = -map.keyframes[kfid].R * map.keyframes[kfid].t;
+    //     }
+
+    //     // Update points
+    //     for (const auto& [point_id, idx] : point_to_param_idx) {
+    //         double* pt = &point_params[idx * point_param_size];
+    //         map.map_points[point_id].position = cv::Point3d(pt[0], pt[1], pt[2]);
+    //     }
+
+    //     // Compute average reprojection error after BA
+    //     double avg_error_after = ComputeAverageReprojectionError(map, cameraMatrix);
+    //     std::cout << "Average Reprojection Error After BA: " << avg_error_after << " px" << std::endl;
+    // }
+
     // After the main loop, analyze map points
     {
         // std::lock_guard<std::mutex> lock(map_mutex);  // Ensure thread-safe access
@@ -264,8 +580,8 @@ int main() {
         int count_high_error_high_obs = 0;
         int count_high_error_low_obs = 0;
 
-        const double error_threshold = 3.0;  // Pixels
-        const int obs_threshold = 3;
+        const double error_threshold = 1.0;  // Pixels
+        const int obs_threshold = 5;
 
         for (const auto& [point_id, point] : map.map_points) {
             if (point.obs.empty() || point.is_bad) continue;

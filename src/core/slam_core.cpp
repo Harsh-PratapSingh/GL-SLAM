@@ -598,9 +598,13 @@ namespace slam_core {
             Frame first;
             first.id = map.next_keyframe_id++;
             first.img = f_img;
-            first.R = cv::Mat::eye(3,3,CV_64F);
-            first.t = cv::Mat::zeros(3,1,CV_64F);
-            
+            cv::Mat Rf = cv::Mat::eye(3,3,CV_64F);
+            cv::Mat tf = cv::Mat::zeros(3,1,CV_64F);
+            Rf = Rf.t();
+            tf = -Rf * tf;
+            first.R = Rf;
+            first.t = tf;
+
             first.sp_res = f_res;
             first.is_keyframe = true;
 
@@ -701,7 +705,7 @@ namespace slam_core {
             
         }
 
-        std::cout << "Updated " << obs1 << " observations" << std::endl;
+        std::cout << "Updated " << obs1 << " for frame " << frame.id << " observations" << std::endl;
 
         std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
               << map.keyframes.size() << " KeyFrames." << std::endl;
@@ -936,208 +940,6 @@ namespace slam_core {
 
         return std::make_tuple(img_cur, R_cur, t_cur, spRes_cur, restPairs, map_point_id, kp_index, skip);
     }   
-
-    // Function to refine pose with motion-only BA
-    void refine_pose_with_g2o(cv::Mat& R_cur, cv::Mat& t_cur, SuperPointTRT::Result& spRes_cur,
-                            std::vector<int>& map_point_id, std::vector<int>& kp_index,
-                            Map& map, cv::Mat& cameraMatrix) {
-        
-        // Setup optimizer
-        g2o::SparseOptimizer optimizer;
-        optimizer.setVerbose(true);
-        typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>> BlockSolverType;
-        typedef g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType> LinearSolverType;
-
-        auto linearSolver = std::make_unique<LinearSolverType>();
-        auto blockSolver = std::make_unique<BlockSolverType>(std::move(linearSolver));
-        auto algorithm = std::make_unique<g2o::OptimizationAlgorithmLevenberg>(std::move(blockSolver));
-        optimizer.setAlgorithm(algorithm.release());  // Transfer ownership to optimizer
-
-        // Add current pose vertex (optimizable)
-        g2o::VertexSE3Expmap* pose_vertex = new g2o::VertexSE3Expmap();
-        g2o::SE3Quat initial_pose;
-        Eigen::Matrix3d R_eig;
-        cv::cv2eigen(R_cur, R_eig);
-        Eigen::Vector3d t_eig;
-        cv::cv2eigen(t_cur, t_eig);
-        initial_pose = g2o::SE3Quat(R_eig, t_eig);
-        pose_vertex->setEstimate(initial_pose);
-        pose_vertex->setId(0);
-        pose_vertex->setFixed(false);
-        optimizer.addVertex(pose_vertex);
-
-        // Camera parameters
-        const double fx = cameraMatrix.at<double>(0, 0);
-        const double fy = cameraMatrix.at<double>(1, 1);
-        const double cx = cameraMatrix.at<double>(0, 2);
-        const double cy = cameraMatrix.at<double>(1, 2);
-        const double thHuber = sqrt(5.99);  // Chi-squared for 2 DoF at 95%
-
-        // Add edges (unary, only connected to pose; fixed points set via Xw)
-        for (size_t i = 0; i < kp_index.size(); ++i) {
-            int point_idx = map_point_id[i];
-            int kp_idx = kp_index[i];
-
-            // Get 3D point from map (adjust to your Map struct, e.g., if map.points is std::vector<cv::Point3f>)
-            cv::Point3d pt3d = map.map_points[point_idx].position;
-            Eigen::Vector3d point3d(pt3d.x, pt3d.y, pt3d.z);
-
-            // Get 2D observation
-            double x = spRes_cur.keypoints[2 * kp_idx];
-            double y = spRes_cur.keypoints[2 * kp_idx + 1];
-            Eigen::Vector2d obs(x, y);
-
-            // Add edge: optimizes only pose, with fixed point in Xw
-            g2o::EdgeSE3ProjectXYZOnlyPose* edge = new g2o::EdgeSE3ProjectXYZOnlyPose();
-            edge->setVertex(0, pose_vertex);
-            edge->setMeasurement(obs);
-            edge->setInformation(Eigen::Matrix2d::Identity());
-            edge->fx = fx;
-            edge->fy = fy;
-            edge->cx = cx;
-            edge->cy = cy;
-            edge->Xw = point3d;  // Fixed world point (no separate vertex needed)
-            edge->setRobustKernel(new g2o::RobustKernelHuber());
-            edge->robustKernel()->setDelta(thHuber);
-            optimizer.addEdge(edge);
-        }
-
-        // Optimize
-        optimizer.initializeOptimization();
-        optimizer.optimize(100);  // Adjust iterations as needed
-
-        // Extract refined pose
-        g2o::SE3Quat refined_pose = pose_vertex->estimate();
-        Eigen::Matrix3d refined_R = refined_pose.rotation().toRotationMatrix();
-        Eigen::Vector3d refined_t = refined_pose.translation();
-        cv::eigen2cv(refined_R, R_cur);
-        cv::eigen2cv(refined_t, t_cur);
-
-        // No manual cleanup needed; optimizer handles algorithm
-
-    }
-
-    
-    OptimizedBAData perform_local_ba(const Map& map, const cv::Mat& K, int window_size, int current_kfid) {
-        OptimizedBAData result;
-
-        // Collect window keyframes
-        int start_kfid = std::max(0, current_kfid - window_size + 1);
-        std::vector<int> window_kfs;
-        for (int i = start_kfid; i <= current_kfid; ++i) {
-            if (map.keyframes.find(i) != map.keyframes.end()) {
-                window_kfs.push_back(i);
-            }
-        }
-        if (window_kfs.size() < 2) return result;  // Skip if too few frames
-
-        // Collect unique visible map points
-        std::unordered_set<int> visible_point_ids;
-        for (int kfid : window_kfs) {
-            const auto& kf = map.keyframes.at(kfid);
-            for (int mpid : kf.map_point_ids) {
-                visible_point_ids.insert(mpid);
-            }
-        }
-        if (visible_point_ids.size() < 8) return result;  // Skip if too few points
-        std::vector<int> point_list(visible_point_ids.begin(), visible_point_ids.end());
-
-        // Set up g2o optimizer
-        g2o::SparseOptimizer optimizer;
-        optimizer.setVerbose(true);
-
-        typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>> BlockSolverType;
-        typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType> LinearSolverType;
-        auto solver = new g2o::OptimizationAlgorithmLevenberg(
-            std::make_unique<BlockSolverType>(std::make_unique<LinearSolverType>()));
-        optimizer.setAlgorithm(solver);
-
-        std::vector<g2o::VertexSE3Expmap*> camera_vertices;
-        for (size_t i = 0; i < window_kfs.size(); ++i) {
-            int kfid = window_kfs[i];
-            const auto& kf = map.keyframes.at(kfid);
-            // Invert pose before setting in g2o
-            // cv::Mat R_inv = kf.R.t();
-            // cv::Mat t_inv = -R_inv * kf.t;
-            cv::Mat R_inv = kf.R.clone();
-            cv::Mat t_inv = kf.t.clone();
-            Eigen::Matrix3d eigR;
-            cv::cv2eigen(R_inv, eigR);
-            Eigen::Vector3d eigt;
-            cv::cv2eigen(t_inv, eigt);
-            g2o::SE3Quat pose(eigR, eigt);
-
-            g2o::VertexSE3Expmap* v_se3 = new g2o::VertexSE3Expmap();
-            v_se3->setEstimate(pose);
-            v_se3->setId(i);
-            if (i == 0) v_se3->setFixed(true); // Fix first camera
-            optimizer.addVertex(v_se3);
-            camera_vertices.push_back(v_se3);
-        }
-
-
-        std::vector<g2o::VertexPointXYZ*> point_vertices;
-        for (size_t i = 0; i < point_list.size(); ++i) {
-            g2o::VertexPointXYZ* v_point = new g2o::VertexPointXYZ();
-            const auto& p = map.map_points.at(point_list[i]);
-            Eigen::Vector3d point_eigen(p.position.x, p.position.y, p.position.z);
-            v_point->setEstimate(point_eigen);
-            v_point->setId(i + window_kfs.size());
-            v_point->setMarginalized(true);
-            optimizer.addVertex(v_point);
-            point_vertices.push_back(v_point);
-        }
-
-        g2o::CameraParameters* cam_params = new g2o::CameraParameters(
-            K.at<double>(0,0), Eigen::Vector2d(K.at<double>(0,2), K.at<double>(1,2)), 0);
-        cam_params->setId(0);
-        optimizer.addParameter(cam_params);
-
-        for (size_t i = 0; i < point_list.size(); ++i) {
-            const auto& p = map.map_points.at(point_list[i]);
-            for (const auto& obs : p.obs) {
-                g2o::EdgeProjectXYZ2UV* edge = new g2o::EdgeProjectXYZ2UV();
-                edge->setVertex(0, point_vertices[i]);
-                edge->setVertex(1, camera_vertices[obs.keyframe_id]);
-                Eigen::Vector2d measurement(obs.point2D.x, obs.point2D.y);
-                edge->setMeasurement(measurement);
-                edge->setInformation(Eigen::Matrix2d::Identity());
-                edge->setParameterId(0, 0);
-                optimizer.addEdge(edge);
-            }
-        }
-
-        // Optimize and log chi2
-        optimizer.initializeOptimization();
-        double initial_chi2 = optimizer.chi2();
-        std::cout << "[BA] Initial chi2: " << initial_chi2 << std::endl;
-        optimizer.optimize(50);  // More iterations for better convergence
-        double final_chi2 = optimizer.chi2();
-        std::cout << "[BA] Final chi2: " << final_chi2 << " (delta: " << (initial_chi2 - final_chi2) << ")" << std::endl;
-
-        for (size_t i = 0; i < camera_vertices.size(); ++i) {
-            g2o::SE3Quat optimized_pose = camera_vertices[i]->estimate();
-            cv::Mat opt_R, opt_t;
-            cv::eigen2cv(optimized_pose.rotation().toRotationMatrix(), opt_R);
-            cv::eigen2cv(optimized_pose.translation(), opt_t);
-            opt_R = opt_R.t();
-            opt_t = -opt_R * opt_t;
-            cv::Mat Rt(3, 4, CV_64F);
-            opt_R.copyTo(Rt.colRange(0, 3));
-            opt_t.copyTo(Rt.col(3));
-            result.optimized_poses.emplace_back(window_kfs[i], Rt);
-
-        }
-        for (size_t i = 0; i < point_vertices.size(); ++i) {
-            Eigen::Vector3d optimized_point = point_vertices[i]->estimate();
-            int pid = point_list[i];
-            cv::Point3d point(optimized_point[0], optimized_point[1], optimized_point[2]);
-            result.optimized_points.emplace_back(pid, point);
-        }
-
-        return result;
-    }
-
 
 
 }
