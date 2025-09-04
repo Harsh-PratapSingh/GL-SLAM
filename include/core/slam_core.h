@@ -80,6 +80,6 @@ namespace slam_core {
             std::string& img_dir_path, cv::Mat& cameraMatrix, float match_thr,
             float map_match_thr, int idx, int window, bool get_inliner, std::vector<cv::Mat>& gtPoses);
 
-    
+    bool full_ba(std::mutex& map_mutex, Map& map, cv::Mat& cameraMatrix, int window);
 
 }
