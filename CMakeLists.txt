@@ -55,8 +55,6 @@ set(CMAKE_BUILD_TYPE Debug)
 
 #library - Add you custom cpp code here and link libraries after this 
 add_library(core 
-    src/core/TensorRTEngineBuilder.cpp    
-    src/core/tensorrt_inference.cpp
     src/core/slam_core.cpp
     src/core/lightglue.cpp
     src/core/superpoint.cpp
