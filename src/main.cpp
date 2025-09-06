@@ -26,9 +26,11 @@ constexpr int SYN_H = 376;   // KITTI gray left image_0 height
 const float match_thr = 0.7f;
 const float map_match_thr = 0.7f;
 const int map_match_window = 20;
-const int Full_ba_window_size = 20;
-const float mag_filter = 0.00f;
-int max_idx   = 600;           // max 4540
+const int Full_ba_window_size = 15;
+const int Full_ba_include_past_optimized_frame_size = 5;
+const float mag_filter = 1.0f;
+const float rot_filter = 1.0f;
+int max_idx   = 4540;           // max 4540
 
 Map map;
 std::mutex map_mutex;  // To synchronize map access
@@ -235,12 +237,19 @@ int main() {
 
         
         double t_mag = std::abs(cv::norm(map.keyframes[prev_triangulated_frame].t) - cv::norm(t_cur));
-        // if(t_mag < mag_filter) continue;
+        
+        
+        
+        
 
         cv::Mat Rc = R_cur.clone(); cv::Mat tc = t_cur.clone();
         Rc = Rc.t();
         tc = -Rc * tc;
 
+        double r_deg = rotationAngleErrorDeg(Rc, map.keyframes[prev_triangulated_frame].R);
+        std::cout << "R_DEG = " << r_deg << std::endl;
+
+        if(t_mag < mag_filter && r_deg < rot_filter) skip = true;
         // Compare with GT
         if (gtPoses.size() > idx) {
             const cv::Mat T_wi = gtPoses[idx];
@@ -266,21 +275,20 @@ int main() {
         bool run_ba = false;
         int window = 0;
         
-        if(t_mag < mag_filter){
+        if(skip){
             newPoints3D.clear();
             newPairs.clear();
             if(map.next_keyframe_id - prev_triangulated_frame > Full_ba_window_size + 10  && map.next_keyframe_id - run_window > Full_ba_window_size ){
                 run_ba = true;
                 window = map.next_keyframe_id - run_window; 
-                run_window = map.next_keyframe_id;
-                
+                // run_window = map.next_keyframe_id;
             }
         }
         else{
             if(map.next_keyframe_id - run_window >= Full_ba_window_size){
                 run_ba = true;
                 window = map.next_keyframe_id - run_window; 
-                run_window = map.next_keyframe_id;
+                // run_window = map.next_keyframe_id;
             }
             prev_triangulated_frame = map.next_keyframe_id;
         }
@@ -337,7 +345,13 @@ int main() {
         std::cout << map.keyframes.size() << std::endl;
 
         if(run_ba){
-            slam_core::full_ba(map_mutex, map, cameraMatrix, (window));
+            int ba_window = 0;
+            if(map.keyframes.size() >= (Full_ba_include_past_optimized_frame_size + window)){
+                ba_window = Full_ba_include_past_optimized_frame_size + window;
+            }
+            else ba_window = window;
+            auto done = slam_core::full_ba(map_mutex, map, cameraMatrix, ba_window);
+            if(done) run_window = map.next_keyframe_id - 1;
             // prev_triangulated_frame = map.next_keyframe_id;
         }
 

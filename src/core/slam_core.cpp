@@ -1091,7 +1091,7 @@ namespace slam_core {
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::SPARSE_SCHUR;  // Or SPARSE_SCHUR for larger problems
         options.minimizer_progress_to_stdout = true;
-        options.max_num_iterations = 25; // increase from default ~50
+        options.max_num_iterations = 50; // increase from default ~50
         options.num_threads = 16;  // Adjust to your CPU cores (e.g., std::thread::hardware_concurrency())
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
