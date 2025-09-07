@@ -63,7 +63,7 @@ namespace slam_core {
 
         sp.setWorkspaceSizeBytes(2ULL << 30);
         sp.setMaxKeypoints(2048);
-        sp.setScoreThreshold(0.0f);
+        sp.setScoreThreshold(0.05f);
         const int spH = 376;
         const int spW = 1241;
         if (!sp.init("../third_party/Superpoint_Lightglue/superpoint_2048.onnx", "superpoint_2048.engine", spH, spW)) {
@@ -74,24 +74,43 @@ namespace slam_core {
         }
     }
 
-    std::vector<Match2D2D> lightglue_score_filter(LightGlueTRT::Result& result, const float& score){
+    std::vector<Match2D2D> lightglue_score_filter(LightGlueTRT::Result& result,Keypt2SubpxTRT::Result& f_result, const float& score){
  
         std::vector<Match2D2D> matches;
         uint16_t lg_matches = result.matches0.size();
         matches.reserve(lg_matches);
-
-        for (int i = 0; i < lg_matches; ++i) {
-            int j = result.matches0[i];
-            if (j >= 0 && result.mscores0[i] > score) {
-                matches.push_back({
-                    i, j,
-                    cv::Point2d((double)result.keypoints0[2*i],     (double)result.keypoints0[2*i + 1]),
-                    cv::Point2d((double)result.keypoints1[2*j],     (double)result.keypoints1[2*j + 1])
-                });
+        int x = 0;
+        if(!f_result.refined_keypt0.empty()){
+            for (int i = 0; i < lg_matches; ++i) {
+                int j = result.matches0[i];
+                if (j >= 0 && result.mscores0[i] > score) {
+                    matches.push_back({
+                        i, j,
+                        cv::Point2d((double)f_result.refined_keypt0[2*x],     (double)f_result.refined_keypt0[2*x + 1]),
+                        cv::Point2d((double)f_result.refined_keypt1[2*x],     (double)f_result.refined_keypt1[2*x + 1])
+                    });
+                    // if(true){
+                    //     std::cout << "i = " << i << std::endl;
+                    //     std::cout << "key0 = " << result.keypoints1[2*j] << std::endl;
+                    //     std::cout << "r_key0 = " << f_result.refined_keypt1[2*x] << std::endl;
+                    // }
+                }
+                if(j>=0) x++;
             }
         }
-
-        matches.shrink_to_fit();
+        else{
+            for (int i = 0; i < lg_matches; ++i) {
+                int j = result.matches0[i];
+                if (j >= 0 && result.mscores0[i] > score) {
+                    matches.push_back({
+                        i, j,
+                        cv::Point2d((double)result.keypoints0[2*i],     (double)result.keypoints0[2*i + 1]),
+                        cv::Point2d((double)result.keypoints1[2*j],     (double)result.keypoints1[2*j + 1])
+                    });
+                }
+            }
+        }
+        // matches.shrink_to_fit();
         std::cout << "Matches(Score = " << score << " ):" << matches.size() << " out of " << lg_matches << std::endl;
 
         return matches;
@@ -108,7 +127,7 @@ namespace slam_core {
         }
 
         cv::Mat essentialMat, mask, R, t;
-        essentialMat = cv::findEssentialMat(points0, points1, K, cv::USAC_MAGSAC, 0.999, 1.0, mask);
+        essentialMat = cv::findEssentialMat(points0, points1, K, cv::USAC_MAGSAC, 0.9999, 0.5, mask);
         int inliers = cv::recoverPose(essentialMat, points0, points1, K, R, t, mask);
 
         return std::make_tuple(R, t, mask);
@@ -223,7 +242,7 @@ namespace slam_core {
     void update_map_and_keyframe_data(Map& map, cv::Mat& img, cv::Mat& R, cv::Mat t,
         SuperPointTRT::Result& Result, std::vector<cv::Point3d>& points3d,
         std::vector<Match2D2D>& filteredPairs, SuperPointTRT::Result& f_res,
-        cv::Mat& f_img, std::vector<int>& map_point_id, std::vector<int>& kp_index, bool if_first_frame = false, bool if_R_t_inversed = false){
+        cv::Mat& f_img, std::vector<ObsPairs>& obsPairs, bool if_first_frame = false, bool if_R_t_inversed = false){
 
         if(if_first_frame){
             Frame first;
@@ -301,15 +320,13 @@ namespace slam_core {
             // Frame 0 observation
             obs0.keyframe_id = frame.id-1;
             obs0.kp_index = pr.idx0;
-            const auto& kps0 = map.keyframes[frame.id-1].sp_res.keypoints;
-            obs0.point2D = cv::Point2d(static_cast<double>(kps0[2*obs0.kp_index]), static_cast<double>(kps0[2*obs0.kp_index+1]));
+            obs0.point2D = pr.p0;
             map.keyframes[frame.id-1].kp_to_mpid[obs0.kp_index] = mp.id;
 
             // Frame 1 observation
             obs1.keyframe_id = frame.id;
             obs1.kp_index = pr.idx1;
-            const auto& kps1 = map.keyframes[frame.id].sp_res.keypoints;
-            obs1.point2D = cv::Point2d(static_cast<double>(kps1[2*obs1.kp_index]), static_cast<double>(kps1[2*obs1.kp_index+1]));
+            obs1.point2D = pr.p1;
             map.keyframes[frame.id].kp_to_mpid[obs1.kp_index] = mp.id;
 
             mp.obs.push_back(obs0);
@@ -322,16 +339,15 @@ namespace slam_core {
         }
         
         int obs1 =0 ;
-        if((!map_point_id.empty() || !kp_index.empty()) && !if_first_frame){
-            for(int i = 0; i < map_point_id.size(); ++i){
+        if(!obsPairs.empty() && !if_first_frame){
+            for(const auto& m : obsPairs){
                 Observation obs;
                 obs.keyframe_id = frame.id;
-                obs.kp_index = kp_index[i];
-                const auto& kps = map.keyframes[frame.id].sp_res.keypoints;
-                obs.point2D = cv::Point2d(static_cast<double>(kps[2*obs.kp_index]), static_cast<double>(kps[2*obs.kp_index+1]));
-                map.keyframes[frame.id].kp_to_mpid[obs.kp_index] = map_point_id[i];
-                map.keyframes[frame.id].map_point_ids.push_back(map_point_id[i]);
-                map.map_points[map_point_id[i]].obs.push_back(obs);
+                obs.kp_index = m.idx1;
+                obs.point2D = m.p1;
+                map.keyframes[frame.id].kp_to_mpid[obs.kp_index] = m.mpid;
+                map.keyframes[frame.id].map_point_ids.push_back(m.mpid);
+                map.map_points[m.mpid].obs.push_back(obs);
                 ++obs1;
             }
             
@@ -444,7 +460,8 @@ namespace slam_core {
         }
 
         auto lgRes     = lg.run_Direct_Inference(synth, sp_res2);
-        auto lgMatches = slam_core::lightglue_score_filter(lgRes, score);
+        Keypt2SubpxTRT::Result R;
+        auto lgMatches = slam_core::lightglue_score_filter(lgRes, R, score);
 
         SynMatches.reserve(lgMatches.size());
         for (const auto& m : lgMatches) {
@@ -459,8 +476,8 @@ namespace slam_core {
     }
 
     std::tuple<cv::Mat, cv::Mat, cv::Mat, SuperPointTRT::Result,
-        std::vector<Match2D2D>, std::vector<int>, std::vector<int>, bool> 
-        run_pnp(Map& map, SuperPointTRT& sp, LightGlueTRT& lg,
+        std::vector<Match2D2D>, std::vector<ObsPairs>, bool> 
+        run_pnp(Map& map, SuperPointTRT& sp, LightGlueTRT& lg, Keypt2SubpxTRT& k2s,
             std::string& img_dir_path, cv::Mat& cameraMatrix, float match_thr,
             float map_match_thr, int idx, int window, bool get_inliner, std::vector<cv::Mat>& gtPoses){
 
@@ -481,7 +498,12 @@ namespace slam_core {
         auto spRes_cur = sp.runInference(img_cur, img_cur.rows, img_cur.cols);
         const auto& kf_prev = map.keyframes.at(prev_kfid);
         auto lgRes_prev_cur = lg.run_Direct_Inference(kf_prev.sp_res, spRes_cur);
-        auto all_pairs = slam_core::lightglue_score_filter(lgRes_prev_cur, match_thr);
+        auto lgRes = lgRes_prev_cur;
+        auto img0 = kf_prev.img.clone();
+        auto img1 = img_cur.clone();
+        auto k2sRes = k2s.run_Direct_Inference(lgRes, img0, img1);
+        std::cout << k2sRes.refined_keypt0.size() << std::endl;
+        auto all_pairs = slam_core::lightglue_score_filter(lgRes_prev_cur, k2sRes, match_thr);
         auto map_matches = slam_core::get_matches_from_previous_frames(
             lg, map, prev_kfid, window, cameraMatrix, spRes_cur, map_match_thr);
         
@@ -491,39 +513,47 @@ namespace slam_core {
         std::vector<int> map_point_id;          
         std::vector<int> kp_index;  
         std::vector<Match2D2D> restPairs;
+        std::vector<ObsPairs> obsPairs;
         p3d_pnp.reserve(all_pairs.size());
         p2d_pnp.reserve(all_pairs.size());
         map_point_id.reserve(all_pairs.size());
         kp_index.reserve(all_pairs.size());
         restPairs.reserve(all_pairs.size());
+        obsPairs.reserve(all_pairs.size());
                     
         int used3d = 0, skipped_no3d = 0;
         int x = 0;
         auto emplace = [](auto& map, auto mpid, auto& p3d_pnp,
                 auto& p2d_pnp, auto& map_point_id, auto& kp_index,
-                auto& used3d, auto& m){
+                auto& used3d, auto& m, auto& obsPairs){
                 p3d_pnp.emplace_back(map.map_points[mpid].position);
                 p2d_pnp.emplace_back(m.p1);
                 map_point_id.push_back(mpid);
                 kp_index.push_back(m.idx1);
+                obsPairs.push_back({mpid, m.idx1, m.p1});
                 used3d++;
+                // std::cout << "m.p1 =" <<m.p1<<std::endl;
+                // std::cout << "position =" <<map.map_points[mpid].position<<std::endl;
+                
             };
 
         for (const auto& m : all_pairs) {
             int mpid = kf_prev.kp_to_mpid[m.idx0];
             if(mpid > 0){
                 emplace(map, mpid, p3d_pnp, p2d_pnp, map_point_id,
-                kp_index, used3d, m);
+                kp_index, used3d, m, obsPairs);
             }else if (map_matches.find(m.idx1) != map_matches.end()){
                 x++;
                 mpid = map_matches[m.idx1].mpid;
                 emplace(map, mpid, p3d_pnp, p2d_pnp, map_point_id,
-                kp_index, used3d, m);
+                kp_index, used3d, m, obsPairs);
             }else{
                 restPairs.push_back(m);
                 skipped_no3d++;
             }
         }
+
+        std::cout << "all pairs size = " <<all_pairs.size() << std::endl;
 
         if ((int)p3d_pnp.size() < 4) {
             std::cerr << "[PnP-Loop] Not enough 3D–2D; skipping frame " << idx << "\n";
@@ -537,7 +567,7 @@ namespace slam_core {
         if(!skip){
             bool ok_pnp = cv::solvePnPRansac(
                 p3d_pnp, p2d_pnp, cameraMatrix, distCoeffs,
-                rvec, tvec, false, 1000, 1.0, 0.999, inliers_pnp, cv::USAC_MAGSAC
+                rvec, tvec, false, 1000, 1.0, 0.9999, inliers_pnp, cv::USAC_MAGSAC
             );
             if (!ok_pnp || (int)inliers_pnp.size() < 4) {
                 std::cerr << "[PnP-Loop] PnP failed/low inliers at frame " << idx << "\n";
@@ -546,12 +576,15 @@ namespace slam_core {
             if (get_inliner){
                 std::vector<int> mapid;
                 std::vector<int> keyid;
+                std::vector<ObsPairs> inlier_obs;
                 for (int idx : inliers_pnp) {
                     mapid.push_back(map_point_id[idx]);
                     keyid.push_back(kp_index[idx]);
+                    inlier_obs.push_back(obsPairs[idx]);
                 }
                 map_point_id = mapid;
                 kp_index = keyid;
+                obsPairs = inlier_obs;
             }
             cv::Rodrigues(rvec, R_cur);
             t_cur = tvec.clone(); 
@@ -572,7 +605,7 @@ namespace slam_core {
                 << " (no-3D=" << skipped_no3d << ")\n";
         std::cerr << "[PnP-Loop] PnP inliers at frame " << idx << " = " << (int)inliers_pnp.size() << " , " << map_point_id.size()  << "\n";
 
-        return std::make_tuple(img_cur, R_cur, t_cur, spRes_cur, restPairs, map_point_id, kp_index, skip);
+        return std::make_tuple(img_cur, R_cur, t_cur, spRes_cur, restPairs, obsPairs, skip);
     }   
 
     struct ReprojectionError {

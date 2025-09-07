@@ -1,5 +1,6 @@
 #include "core/lightglue.h"
 #include "core/superpoint.h"
+#include "core/keypt2subpx.h"
 #include "core/slam_core.h"
 #include "visualization/visualization.h"
 #include <opencv2/opencv.hpp>
@@ -30,7 +31,7 @@ const int Full_ba_window_size = 15;
 const int Full_ba_include_past_optimized_frame_size = 5;
 const float mag_filter = 1.0f;
 const float rot_filter = 1.0f;
-int max_idx   = 4540;           // max 4540
+int max_idx   = 2000;           // max 4540
 
 Map map;
 std::mutex map_mutex;  // To synchronize map access
@@ -74,58 +75,7 @@ static double rotationAngleErrorDeg(const cv::Mat& R_est, const cv::Mat& R_gt) {
 
 // ... (rest of your existing includes and code)
 int stop = 0;
-// Define the reprojection error cost function
-// Define the reprojection error cost function
-struct ReprojectionError {
-    ReprojectionError(const cv::Point2d& observed, const cv::Mat& camera_matrix)
-        : observed_(observed), camera_matrix_(camera_matrix) {}
-
-    template <typename T>
-    bool operator()(const T* const camera,  // 6 params: angle-axis rotation + translation
-                    const T* const point,   // 3 params: 3D point
-                    T* residuals) const {
-        // Camera params: camera[0,1,2] = angle-axis rotation, camera[3,4,5] = translation
-        // Assuming pose is camera-to-world: invert to get world-to-camera
-        T p_trans[3];
-        p_trans[0] = point[0] - camera[3];
-        p_trans[1] = point[1] - camera[4];
-        p_trans[2] = point[2] - camera[5];
-
-        // Apply inverse rotation (transpose, i.e., rotate by -angle_axis)
-        T minus_camera[3] = { -camera[0], -camera[1], -camera[2] };
-        T p[3];
-        ceres::AngleAxisRotatePoint(minus_camera, p_trans, p);
-
-        // Project to normalized image coordinates
-        T xp = p[0] / p[2];
-        T yp = p[1] / p[2];
-
-        // Apply camera matrix (fx, fy, cx, cy; assuming no skew or distortion)
-        T fx = T(camera_matrix_.at<double>(0, 0));
-        T fy = T(camera_matrix_.at<double>(1, 1));
-        T cx = T(camera_matrix_.at<double>(0, 2));
-        T cy = T(camera_matrix_.at<double>(1, 2));
-
-        T predicted_x = fx * xp + cx;
-        T predicted_y = fy * yp + cy;
-
-        // Residuals
-        residuals[0] = predicted_x - T(observed_.x);
-        residuals[1] = predicted_y - T(observed_.y);
-
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const cv::Point2d& observed, const cv::Mat& camera_matrix) {
-        return new ceres::AutoDiffCostFunction<ReprojectionError, 2, 6, 3>(
-            new ReprojectionError(observed, camera_matrix));
-    }
-
-    cv::Point2d observed_;
-    cv::Mat camera_matrix_;
-};
-
-
+// Rep
 // Function to compute average reprojection error (extracted from your existing code)
 double ComputeAverageReprojectionError(const Map& map, const cv::Mat& cameraMatrix) {
     double total_error = 0.0;
@@ -167,11 +117,110 @@ double ComputeAverageReprojectionError(const Map& map, const cv::Mat& cameraMatr
 
 const int ba_window_size = 3;  // Adjust based on performance; e.g., 5-15
 
+// New function to compute fundamental matrix from R, t, K
+cv::Mat computeFundamentalMatrix(const cv::Mat& R, const cv::Mat& t, const cv::Mat& K) {
+    // Compute essential matrix E = [t]_x * R
+    cv::Mat skew_t = (cv::Mat_<double>(3,3) << 0, -t.at<double>(2), t.at<double>(1),
+                                                t.at<double>(2), 0, -t.at<double>(0),
+                                                -t.at<double>(1), t.at<double>(0), 0);
+    cv::Mat E = skew_t * R;
+
+    // Fundamental matrix F = K^{-T} * E * K^{-1}
+    cv::Mat K_inv = K.inv();
+    cv::Mat F = K_inv.t() * E * K_inv;
+
+    return F;
+}
+
+// New function to calculate average matched point to epipolar line distance
+double calculateAvgEpipolarDistance(const std::vector<Match2D2D>& pairs, const cv::Mat& F) {
+    double total_dist = 0.0;
+    int count = 0;
+
+    for (const auto& pr : pairs) {
+        cv::Point2d p1 = pr.p0;  // Assuming MatchPair has pt1 and pt2 as cv::Point2d
+        cv::Point2d p2 = pr.p1;
+
+        // Homogeneous points
+        cv::Mat p1h = (cv::Mat_<double>(3,1) << p1.x, p1.y, 1.0);
+        cv::Mat p2h = (cv::Mat_<double>(3,1) << p2.x, p2.y, 1.0);
+
+        // Epipolar line in image 2 for p1: F * p1
+        cv::Mat line2 = F * p1h;
+        double denom2 = std::sqrt(line2.at<double>(0)*line2.at<double>(0) + line2.at<double>(1)*line2.at<double>(1));
+        double dist2 = std::abs(line2.dot(p2h)) / (denom2 + 1e-9);  // Avoid division by zero
+
+        // Epipolar line in image 1 for p2: F^T * p2
+        cv::Mat line1 = F.t() * p2h;
+        double denom1 = std::sqrt(line1.at<double>(0)*line1.at<double>(0) + line1.at<double>(1)*line1.at<double>(1));
+        double dist1 = std::abs(line1.dot(p1h)) / (denom1 + 1e-9);
+
+        // Symmetric distance
+        total_dist += (dist1 + dist2) / 2.0;
+        count++;
+    }
+
+    return (count > 0) ? (total_dist / count) : 0.0;
+}
+
+// New function to visualize epipolar lines and points
+void visualizeEpipolarLines(const std::vector<Match2D2D>& pairs, const cv::Mat& F, cv::Mat img1, cv::Mat img2, const std::string& window_name) {
+    cv::Mat img1_color, img2_color;
+    cv::cvtColor(img1, img1_color, cv::COLOR_GRAY2BGR);
+    cv::cvtColor(img2, img2_color, cv::COLOR_GRAY2BGR);
+
+    // Collect points
+    std::vector<cv::Point2f> points1, points2;
+    for (const auto& pr : pairs) {
+        points1.push_back(cv::Point2f(static_cast<float>(pr.p0.x), static_cast<float>(pr.p0.y)));  // Assuming pt1/pt2 are double
+        points2.push_back(cv::Point2f(static_cast<float>(pr.p1.x), static_cast<float>(pr.p1.y)));
+    }
+
+    // Compute epipolar lines
+    std::vector<cv::Vec3f> lines1, lines2;
+    cv::computeCorrespondEpilines(points2, 2, F, lines1);  // Lines in img1 corresponding to points in img2
+    cv::computeCorrespondEpilines(points1, 1, F, lines2);  // Lines in img2 corresponding to points in img1
+
+    // Draw on img1: points and lines
+    for (size_t i = 0; i < points1.size(); ++i) {
+        // Draw point in img1
+        cv::circle(img1_color, points1[i], 3, cv::Scalar(0, 255, 0), -1);
+
+        // Draw epipolar line in img1 (for point in img2)
+        cv::Vec3f line = lines1[i];
+        cv::Point pt1(0, static_cast<int>(-line[2] / line[1]));
+        cv::Point pt2(img1_color.cols, static_cast<int>(-(line[2] + line[0] * img1_color.cols) / line[1]));
+        cv::line(img1_color, pt1, pt2, cv::Scalar(0, 0, 255), 1);
+    }
+
+    // Draw on img2: points and lines
+    for (size_t i = 0; i < points2.size(); ++i) {
+        // Draw point in img2
+        cv::circle(img2_color, points2[i], 3, cv::Scalar(0, 255, 0), -1);
+
+        // Draw epipolar line in img2 (for point in img1)
+        cv::Vec3f line = lines2[i];
+        cv::Point pt1(0, static_cast<int>(-line[2] / line[1]));
+        cv::Point pt2(img2_color.cols, static_cast<int>(-(line[2] + line[0] * img2_color.cols) / line[1]));
+        cv::line(img2_color, pt1, pt2, cv::Scalar(0, 0, 255), 1);
+    }
+
+    // Display side by side
+    cv::Mat combined;
+    cv::hconcat(img1_color, img2_color, combined);
+    cv::imshow(window_name, combined);
+    cv::waitKey(1);  // Brief display; adjust as needed
+}
 
 int main() {
     SuperPointTRT sp;
     LightGlueTRT lg;
     slam_core::superpoint_lightglue_init(sp, lg);
+    Keypt2SubpxTRT k2s;
+    if (!k2s.init("../third_party/Keypt2Subpx/keypt2subpx_splg.onnx", "keypt2subpx_splg.engine")) {
+        std::cerr << "Failed to initialize Keypt2SubpxTRT" << std::endl;
+        return -1;
+    }
 
     auto cameraMatrix = slam_core::load_camera_matrix(calibPath);
     auto gtPoses = slam_core::load_poses(posesPath);
@@ -180,7 +229,11 @@ int main() {
     auto spRes0 = sp.runInference(img0, img0.rows, img0.cols);
     auto spRes1 = sp.runInference(img1, img1.rows, img1.cols);
     auto lgRes = lg.run_Direct_Inference(spRes0, spRes1);
-    auto matches = slam_core::lightglue_score_filter(lgRes, match_thr);
+    Keypt2SubpxTRT::Result k2sRes = k2s.run_Direct_Inference(lgRes, img0, img1);
+    Keypt2SubpxTRT::Result R23;
+    // std::cout << "Number of refined matches: " << (lgRes.keypoints0[835 * 2 + 0]) << std::endl;
+    // std::cout << "Number of refined matches: " << (k2sRes.refined_keypt0[0]) << std::endl;
+    auto matches = slam_core::lightglue_score_filter(lgRes, k2sRes, match_thr);
     if (matches.size() < 8) {
         std::cerr << "Not enough matches for pose estimation." << std::endl;
         return 1;
@@ -191,13 +244,18 @@ int main() {
     // t = -R * t;
     t = slam_core::adjust_translation_magnitude(gtPoses, t, 1);
 
+    cv::Mat F_bootstrap = computeFundamentalMatrix(R, t, cameraMatrix);
+    double avg_dist_bootstrap = calculateAvgEpipolarDistance(matches, F_bootstrap);
+    std::cout << "Bootstrap Average Epipolar Distance: " << avg_dist_bootstrap << " px" << std::endl;
+    // while(true) visualizeEpipolarLines(inliersPairs, F_bootstrap, img0, img1, "Bootstrap Epipolar Lines");
+
     cv::Mat R1 = cv::Mat::eye(3, 3, CV_64F);
     cv::Mat t1 = cv::Mat::zeros(3, 1, CV_64F);
-    auto [points3d, filteredPairs] = slam_core::triangulate_and_filter_3d_points(R1, t1, R, t, cameraMatrix, inliersPairs, 100.0, 0.5 );
+    auto [points3d, filteredPairs] = slam_core::triangulate_and_filter_3d_points(R1, t1, R, t, cameraMatrix, matches, 100.0, 0.5 );
     
-    std::vector<int> a;
+    std::vector<ObsPairs> a;
     slam_core::update_map_and_keyframe_data(map, img1, R, t, spRes1, points3d,
-                                            filteredPairs, spRes0, img0, a, a, true, true);
+                                            filteredPairs, spRes0, img0, a, true, true);
 
     std::cout << "Camera Matrix:\n" << cameraMatrix << std::endl;
     std::cout << "Image0: valid keypoints = " << spRes0.numValid << std::endl;
@@ -212,21 +270,15 @@ int main() {
 
     
     // const int start_idx = map.next_keyframe_id;     
-        const int start_idx = 2;            
+    const int start_idx = 2;            
        
-    
-    // auto img_name = [](int idx) {
-    //         char buf[32];
-    //         std::snprintf(buf, sizeof(buf), "%06d.png", idx);
-    //         return std::string(buf);
-    //     };
     int prev_triangulated_frame = map.next_keyframe_id -1;
     int run_window = -1;
     for (int idx = start_idx; idx <= max_idx; ++idx) {
         const int prev_kfid = map.next_keyframe_id - 1; 
-   
-        auto [img_cur, R_cur, t_cur, spRes_cur, restPairs, map_point_id,
-                kp_index, skip] = slam_core::run_pnp(map, sp, lg, img_dir_path,
+        
+        auto [img_cur, R_cur, t_cur, spRes_cur, restPairs, obsPairs,
+                skip] = slam_core::run_pnp(map, sp, lg, k2s, img_dir_path,
                 cameraMatrix, match_thr, map_match_thr, idx, map_match_window, false, gtPoses);
         if(skip) continue;
 
@@ -305,8 +357,7 @@ int main() {
                 /*pairs*/    newPairs,
                 /*spRes_prev*/ spRes_cur,
                 /*img_prev*/  img_cur,   // ensure kf_prev.img was stored at bootstrap
-                /*map_point_obs_id*/ map_point_id,      //exp
-                /*obs_kp_index*/ kp_index,
+                /*map_point_obs_id*/ obsPairs,      //exp,
                 /*is_first_frame*/ false,
                 /*is_cur_kf*/  true
             );
@@ -334,9 +385,9 @@ int main() {
             cv::circle(img1_color, cv::Point2f(x, y), 2, cv::Scalar(255, 0, 0), -1, cv::LINE_AA);
         }
 
-        for( auto i : kp_index){
-            float x = (float)kf2.keypoints[2 * i];
-            float y = (float)kf2.keypoints[2 * i + 1];
+        for( auto i : obsPairs){
+            float x = (float)i.p1.x;
+            float y = (float)i.p1.y;
             cv::circle(img1_color, cv::Point2f(x, y), 2, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
         }
         
@@ -737,6 +788,18 @@ int main() {
         std::cout << "Frame 1 :-" << std::endl;
         std::cout << " R : " << map.keyframes[1].R << std::endl;
         std::cout << " t : " << map.keyframes[1].t << std::endl;
+
+        {
+            const cv::Mat T_wi = gtPoses[1];
+            cv::Mat R_gt = T_wi(cv::Rect(0,0,3,3)).clone();
+            cv::Mat t_gt = T_wi(cv::Rect(3,0,1,3)).clone();
+
+            double rot_err = rotationAngleErrorDeg(map.keyframes[1].R, R_gt);
+            double t_dir_err = angleBetweenVectorsDeg(map.keyframes[1].t, t_gt);
+            double t_mag_err = std::abs(cv::norm(map.keyframes[1].t) - cv::norm(t_gt));
+            std::cout << "[PnP-Loop] Frame " << 1 << " | rot(deg): " << rot_err
+                    << " t_dir(deg): " << t_dir_err << " t_mag(m): " << t_mag_err << "\n";
+        }
     }
 
 

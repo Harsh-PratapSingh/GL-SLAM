@@ -59,6 +59,12 @@ struct Match2D2D {
     cv::Point2d p1;   // 2D point in frame1
 };
 
+struct ObsPairs {
+    int mpid;
+    int idx1;
+    cv::Point2d p1;
+};
+
 //Match struct for when we match current frame with synthetic frame
 struct SyntheticMatch {
     int idx_curr_frame;

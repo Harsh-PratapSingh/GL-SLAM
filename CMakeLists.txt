@@ -58,6 +58,7 @@ add_library(core
     src/core/slam_core.cpp
     src/core/lightglue.cpp
     src/core/superpoint.cpp
+    src/core/keypt2subpx.cpp
 )
 target_include_directories(core PUBLIC 
     ${CMAKE_SOURCE_DIR}/include/

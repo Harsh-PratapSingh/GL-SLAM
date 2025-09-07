@@ -5,8 +5,9 @@
 #include <opencv2/core/eigen.hpp>
 #include <vector>
 #include <string>
-#include "superpoint.h"
-#include "lightglue.h"
+#include "core/superpoint.h"
+#include "core/lightglue.h"
+#include "core/keypt2subpx.h"
 
 constexpr float SCORE_THRESHOLD = 0.5f;
 constexpr int IMAGE_WIDTH = 1241;
@@ -21,7 +22,7 @@ namespace slam_core {
 
     void superpoint_lightglue_init(SuperPointTRT& sp, LightGlueTRT& lg);
                         
-    std::vector<Match2D2D> lightglue_score_filter(LightGlueTRT::Result& result, const float& score);
+    std::vector<Match2D2D> lightglue_score_filter(LightGlueTRT::Result& result,Keypt2SubpxTRT::Result& f_result, const float& score);
     
     std::tuple<cv::Mat, cv::Mat, cv::Mat> pose_estimator(std::vector<Match2D2D>& matches, cv::Mat& K);
 
@@ -36,7 +37,7 @@ namespace slam_core {
     void update_map_and_keyframe_data(Map& map, cv::Mat& img, cv::Mat& R, cv::Mat t,
         SuperPointTRT::Result& Result, std::vector<cv::Point3d>& points3d,
         std::vector<Match2D2D>& filteredPairs, SuperPointTRT::Result& f_res,
-        cv::Mat& f_img, std::vector<int>& map_point_id, std::vector<int>& kp_index, bool if_first_frame, bool if_R_t_inversed);
+        cv::Mat& f_img, std::vector<ObsPairs>& obsPairs, bool if_first_frame, bool if_R_t_inversed);
        
     std::unordered_map<int, SyntheticMatch> get_matches_from_previous_frames(
         LightGlueTRT& lg,
@@ -49,8 +50,8 @@ namespace slam_core {
     );
 
     std::tuple<cv::Mat, cv::Mat, cv::Mat, SuperPointTRT::Result,
-        std::vector<Match2D2D>, std::vector<int>, std::vector<int>, bool> 
-        run_pnp(Map& map, SuperPointTRT& sp, LightGlueTRT& lg,
+        std::vector<Match2D2D>, std::vector<ObsPairs>, bool> 
+        run_pnp(Map& map, SuperPointTRT& sp, LightGlueTRT& lg, Keypt2SubpxTRT& k2s,
             std::string& img_dir_path, cv::Mat& cameraMatrix, float match_thr,
             float map_match_thr, int idx, int window, bool get_inliner, std::vector<cv::Mat>& gtPoses);
 
