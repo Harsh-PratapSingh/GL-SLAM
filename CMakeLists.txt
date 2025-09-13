@@ -55,6 +55,7 @@ set(CMAKE_BUILD_TYPE Debug)
 
 #library - Add you custom cpp code here and link libraries after this 
 add_library(core 
+    src/core/slam_types.cpp
     src/core/slam_core.cpp
     src/core/lightglue.cpp
     src/core/superpoint.cpp
@@ -102,12 +103,24 @@ target_link_libraries(visualization
     ${Pangolin_LIBRARIES}
 )
 
+add_library(threading
+    src/threading/thread_pool.cpp
+)
+target_include_directories(threading PUBLIC 
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(threading
+    core
+)
+
+
 
 add_executable(lightglue_infer src/main.cpp)
 
 target_link_libraries(lightglue_infer
     core
     visualization
+    threading
 )
 
 # # Set rpath for runtime linking

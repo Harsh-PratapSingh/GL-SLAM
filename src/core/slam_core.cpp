@@ -18,6 +18,23 @@
 
 namespace slam_core {
 
+    double angleBetweenVectorsDeg(const cv::Mat& a, const cv::Mat& b) {
+        cv::Mat af, bf;
+        a.convertTo(af, CV_64F);
+        b.convertTo(bf, CV_64F);
+        double na = cv::norm(af), nb = cv::norm(bf);
+        if (na < 1e-9 || nb < 1e-9) return 0.0;
+        double cosang = af.dot(bf) / (na * nb);
+        cosang = std::max(-1.0, std::min(1.0, cosang));
+        return std::acos(cosang) * 180.0 / CV_PI;
+    }
+
+    double rotationAngleErrorDeg(const cv::Mat& R_est, const cv::Mat& R_gt) {
+        cv::Mat R_err = R_gt.t() * R_est;
+        double tr = std::max(-1.0, std::min(1.0, (R_err.at<double>(0,0) + R_err.at<double>(1,1) + R_err.at<double>(2,2) - 1.0) * 0.5));
+        return std::acos(tr) * 180.0 / CV_PI;
+    }
+
     cv::Mat load_camera_matrix(const std::string& calibPath) {
         std::ifstream file(calibPath);
         if (!file.is_open()) {
@@ -57,7 +74,6 @@ namespace slam_core {
         }
         return poses;
     }
-
 
     void superpoint_lightglue_init(SuperPointTRT& sp, LightGlueTRT& lg){
 
@@ -268,6 +284,9 @@ namespace slam_core {
         frame.id = map.next_keyframe_id++;
         frame.img = img;
 
+        bool unoptimized = false;
+        if(slam_types::run_window < frame.id && slam_types::run_window != -1) unoptimized = true;
+
         if(if_R_t_inversed){
 
             auto R1 = map.keyframes[frame.id-1].R;       
@@ -335,6 +354,7 @@ namespace slam_core {
             map.keyframes[frame.id].map_point_ids.push_back(mp.id);
 
             map.map_points[mp.id] = mp;
+            if(unoptimized) slam_types::mpid_to_correct.push_back(mp.id);
             
         }
         
@@ -352,9 +372,9 @@ namespace slam_core {
             }
             
         }
+        if(unoptimized) slam_types::kpid_to_correct.push_back(frame.id);
 
         std::cout << "Updated " << obs1 << " for frame " << frame.id << " observations" << std::endl;
-
         std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
               << map.keyframes.size() << " KeyFrames." << std::endl;
 
@@ -501,9 +521,11 @@ namespace slam_core {
         auto lgRes = lgRes_prev_cur;
         auto img0 = kf_prev.img.clone();
         auto img1 = img_cur.clone();
+        // Keypt2SubpxTRT::Result k2sRes;
         auto k2sRes = k2s.run_Direct_Inference(lgRes, img0, img1);
         std::cout << k2sRes.refined_keypt0.size() << std::endl;
         auto all_pairs = slam_core::lightglue_score_filter(lgRes_prev_cur, k2sRes, match_thr);
+
         auto map_matches = slam_core::get_matches_from_previous_frames(
             lg, map, prev_kfid, window, cameraMatrix, spRes_cur, map_match_thr);
         
@@ -567,8 +589,9 @@ namespace slam_core {
         if(!skip){
             bool ok_pnp = cv::solvePnPRansac(
                 p3d_pnp, p2d_pnp, cameraMatrix, distCoeffs,
-                rvec, tvec, false, 1000, 1.0, 0.9999, inliers_pnp, cv::USAC_MAGSAC
+                rvec, tvec, false, 1000, 1.8, 0.999, inliers_pnp, cv::USAC_MAGSAC
             );
+            
             if (!ok_pnp || (int)inliers_pnp.size() < 4) {
                 std::cerr << "[PnP-Loop] PnP failed/low inliers at frame " << idx << "\n";
                 skip = true;
@@ -582,6 +605,12 @@ namespace slam_core {
                     keyid.push_back(kp_index[idx]);
                     inlier_obs.push_back(obsPairs[idx]);
                 }
+                // for (auto& m : inliersPairs) {
+                //     auto idx = m.idx1;
+                //     mapid.push_back(map_point_id[idx]);
+                //     keyid.push_back(kp_index[idx]);
+                //     inlier_obs.push_back(obsPairs[idx]);
+                // }
                 map_point_id = mapid;
                 kp_index = keyid;
                 obsPairs = inlier_obs;
@@ -590,6 +619,14 @@ namespace slam_core {
             t_cur = tvec.clone(); 
             R_cur.convertTo(R_cur, CV_64F);
             t_cur.convertTo(t_cur, CV_64F);
+            // auto [R, t, mask] = slam_core::pose_estimator(all_pairs, cameraMatrix);
+            // auto inliersPairs = slam_core::pose_estimator_mask_filter(all_pairs, mask);
+            // R = R.t(); t = -R * t;
+            // cv::Mat R_prev = slam_types::map.keyframes[idx-1].R.clone();
+            // cv::Mat t_prev = slam_types::map.keyframes[idx-1].t.clone();
+            // R_cur = R * R_prev;
+            // t_cur = R * t_prev + t;
+
             // R_cur = R_cur.t();
             // t_cur = -R_cur * t_cur;
 
@@ -667,11 +704,11 @@ namespace slam_core {
         // Collect and convert camera poses
         // std::unique_lock<std::mutex> lock(map_mutex);
         std::cout << 1 << std::endl;
-        int first_frame_idx = map.next_keyframe_id - window;
+        int first_frame_idx = slam_types::run_window + 1 - window;
         for(int i = first_frame_idx; i < first_frame_idx + window; ++i){
             const auto& kf = map.keyframes.at(i);
             kf_to_param_idx[i] = camera_params.size() / cam_param_size;
-            std::cout << "kf_to_param: " << kf_to_param_idx[i] << std::endl;
+            std::cout << "kf_index: " << i << std::endl;
             cv::Mat Rr = kf.R;
             cv::Mat Tr = kf.t;
             // Rr = Rr.t();
@@ -751,37 +788,33 @@ namespace slam_core {
         std::cout << 6 << std::endl;
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::SPARSE_SCHUR;  // Or SPARSE_SCHUR for larger problems
+        options.preconditioner_type = ceres::CLUSTER_JACOBI;
         options.minimizer_progress_to_stdout = true;
         options.max_num_iterations = 50; // increase from default ~50
-        options.num_threads = 16;  // Adjust to your CPU cores (e.g., std::thread::hardware_concurrency())
+        options.num_threads = 10;  // Adjust to your CPU cores (e.g., std::thread::hardware_concurrency())
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-        std::cout << summary.FullReport() << std::endl;
+        // std::cout << summary.FullReport() << std::endl;
 
         std::cout << 7 << std::endl;
-        std::lock_guard<std::mutex> lk(map_mutex);
-        for (const auto& [kfid, idx] : kf_to_param_idx) {
-            double* cam = &camera_params[idx * cam_param_size];
-            // cv::Mat Rr = (cv::Mat_<double>(3,1) << cam[0], cam[1], cam[2]);
-            // cv::Mat Tr = (cv::Mat_<double>(3,1) << cam[3], cam[4], cam[5]);
-
-            // Rr = Rr.t();
-            // Tr = -Rr * Tr;
-            
-            // cv::Rodrigues(Rr, map.keyframes[kfid].R);
-            // map.keyframes[kfid].t = Tr;
-            cv::Mat angle_axis = (cv::Mat_<double>(3,1) << cam[0], cam[1], cam[2]);
-            cv::Rodrigues(angle_axis, map.keyframes[kfid].R);
-            map.keyframes[kfid].t = (cv::Mat_<double>(3,1) << cam[3], cam[4], cam[5]);
-            // map.keyframes[kfid].R = map.keyframes[kfid].R.t();
-            // map.keyframes[kfid].t = -map.keyframes[kfid].R * map.keyframes[kfid].t;
+        {
+            std::lock_guard<std::mutex> tracking_lock(slam_types::tracking_mutex);
+            std::lock_guard<std::mutex> lk(map_mutex);
+            for (const auto& [kfid, idx] : kf_to_param_idx) {
+                double* cam = &camera_params[idx * cam_param_size];
+                cv::Mat angle_axis = (cv::Mat_<double>(3,1) << cam[0], cam[1], cam[2]);
+                cv::Rodrigues(angle_axis, map.keyframes[kfid].R);
+                map.keyframes[kfid].t = (cv::Mat_<double>(3,1) << cam[3], cam[4], cam[5]);
+                // map.keyframes[kfid].R = map.keyframes[kfid].R.t();
+                // map.keyframes[kfid].t = -map.keyframes[kfid].R * map.keyframes[kfid].t;
+            }
+            std::cout << 8 << std::endl;
+            for (const auto& [point_id, idx] : point_to_param_idx) {
+                double* pt = &point_params[idx * point_param_size];
+                map.map_points[point_id].position = cv::Point3d(pt[0], pt[1], pt[2]);
+            }
+            std::cout << 9 << std::endl;
         }
-        std::cout << 8 << std::endl;
-        for (const auto& [point_id, idx] : point_to_param_idx) {
-            double* pt = &point_params[idx * point_param_size];
-            map.map_points[point_id].position = cv::Point3d(pt[0], pt[1], pt[2]);
-        }
-        std::cout << 9 << std::endl;
         return true;
 
     }

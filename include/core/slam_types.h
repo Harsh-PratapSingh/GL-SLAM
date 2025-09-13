@@ -1,46 +1,36 @@
 #pragma once
 #include <opencv2/opencv.hpp>
+#include <core/lightglue.h>
 #include <core/superpoint.h>
+#include <core/keypt2subpx.h>
+#include <condition_variable>
 
-// struct Observation {
-//     int camera_idx;       // Index of the camera/image
-//     cv::Point2f point2D;  // Observed 2D point in the image
-// };
-
-// struct Point3D {
-//     cv::Point3f position;            // 3D position in world coordinates
-//     std::vector<Observation> observations; // List of observations in different images
-// };
-
-// A 2D observation of a 3D point in a specific keyframe
 struct Observation {
     int keyframe_id;
     cv::Point2d point2D;
-    int kp_index; //NEW
+    int kp_index; 
     // const Frame& kf = map.keyframes[obs.keyframe_id];
     // const float* desc = &kf.descriptors[obs.kp_index*256]; // For when to acces descriptors later
 };
 
 struct MapPoint {
     int id;
-    cv::Point3d position;            // World coordinates
-    std::vector<Observation> obs;    // Observations in various keyframes
-    bool is_bad = false;
-    // No descriptor here as requested
+    cv::Point3d position;            
+    std::vector<Observation> obs;  
+    bool is_bad = false; 
 };
 
 struct Frame {
     int id;
-    cv::Mat img;              // Grayscale or RGB
-    cv::Mat R;                // 3x3 rotation (world <- camera)
-    cv::Mat t;                // 3x1 translation (world <- camera)
+    cv::Mat img;              
+    cv::Mat R;                
+    cv::Mat t;                
 
     SuperPointTRT::Result sp_res;
     std::vector<int64_t> keypoints;
-    // cv::Mat descriptors;      // CV_32F matrix: rows = num keypoints, cols = 256
     std::vector<float> descriptors;
     std::vector<int> map_point_ids;
-    std::vector<int> kp_to_mpid;    // NEW: size N, filled after mapping
+    std::vector<int> kp_to_mpid;    
     bool is_keyframe = false;
 };
 
@@ -51,12 +41,12 @@ struct Map {
     int next_keyframe_id = 0;
 };
 
-// NEW: Compact record carrying original SP indices and 2D locations
+
 struct Match2D2D {
-    int idx0;         // SuperPoint index in frame0
-    int idx1;         // SuperPoint index in frame1
-    cv::Point2d p0;   // 2D point in frame0
-    cv::Point2d p1;   // 2D point in frame1
+    int idx0;         
+    int idx1;         
+    cv::Point2d p0;   
+    cv::Point2d p1;  
 };
 
 struct ObsPairs {
@@ -65,33 +55,46 @@ struct ObsPairs {
     cv::Point2d p1;
 };
 
-//Match struct for when we match current frame with synthetic frame
+
 struct SyntheticMatch {
     int idx_curr_frame;
     int mpid;
 };
 
+namespace slam_types {
+    
+    extern const float match_thr;
+    extern const float map_match_thr;
+    extern const int map_match_window;
+    extern const int Full_ba_window_size;
+    extern const int Full_ba_include_past_optimized_frame_size;
+    extern const float mag_filter;
+    extern const float rot_filter;
+    extern int max_idx;   
+    extern int run_window;   
 
-//A bad visual slam is quite easy to implement. I give you a rough roadmap:
+    extern Map map;
+    extern std::mutex map_mutex; 
+    extern std::mutex local_ba_mutex;
+    extern std::mutex tracking_mutex;
 
-// Feature extraction for input image
+    extern std::string img_dir_path;
+    extern std::string calibPath;
+    extern std::string posesPath;
 
-// Match features to previous image(s)
+    extern SuperPointTRT sp;
+    extern LightGlueTRT lg;
+    extern Keypt2SubpxTRT ks;
 
-// Compute essential matrix
+    extern std::condition_variable cv_local_ba;     
+    extern std::condition_variable run_tracking; 
+    extern bool tracking_frame;
+    extern bool local_ba_writing;
+    extern bool local_ba_start; 
+    extern int local_ba_window;
+    extern bool local_ba_done; 
 
-// Decompose essential matrix into pose
+    extern std::vector<int> mpid_to_correct;
+    extern std::vector<int> kpid_to_correct;
+}
 
-// Triangulate initial point cloud
-
-// Check if initialisation is good (enough inliers)
-
-// Once initialisation is done:
-
-// Use constant velocity model to predict next pose
-
-// Use predicted pose to project existing map points into the camera and check if they match with 2D features nearby
-
-// Use successful 2D/3D correspondences to compute an optimised pose (motion only bundle adjustment)
-
-// Use optimised frame to triangulate new points

@@ -3,41 +3,9 @@
 #include "core/keypt2subpx.h"
 #include "core/slam_core.h"
 #include "visualization/visualization.h"
-#include <opencv2/opencv.hpp>
-#include <iostream>
-#include <stdexcept>
-#include <vector>
-#include <algorithm>
-#include <cmath>
-#include <fstream>
-#include <sstream>
-
-
-#include <chrono> // for time measurement
-
-#include <pangolin/pangolin.h>
+#include "threading/thread_pool.h"
+#include <chrono> 
 #include <thread>
-#include <mutex>
-
-#include <unordered_set>
-#include <set>
-
-constexpr int SYN_W = 1241;  // KITTI gray left image_0 width
-constexpr int SYN_H = 376;   // KITTI gray left image_0 height
-const float match_thr = 0.7f;
-const float map_match_thr = 0.7f;
-const int map_match_window = 20;
-const int Full_ba_window_size = 15;
-const int Full_ba_include_past_optimized_frame_size = 5;
-const float mag_filter = 1.0f;
-const float rot_filter = 1.0f;
-int max_idx   = 2000;           // max 4540
-
-Map map;
-std::mutex map_mutex;  // To synchronize map access
-std::string img_dir_path = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/image_0/";
-std::string calibPath = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/calib.txt";
-std::string posesPath = "/home/tomato/Downloads/data_odometry_gray/dataset/sequences/00/00.txt";
 
 static cv::Mat invertSE3(const cv::Mat& T) {
     cv::Mat R = T(cv::Rect(0,0,3,3)).clone();
@@ -69,13 +37,6 @@ static double rotationAngleErrorDeg(const cv::Mat& R_est, const cv::Mat& R_gt) {
     return std::acos(tr) * 180.0 / CV_PI;
 }
 
-
-#include <ceres/ceres.h>
-#include <ceres/rotation.h>
-
-// ... (rest of your existing includes and code)
-int stop = 0;
-// Rep
 // Function to compute average reprojection error (extracted from your existing code)
 double ComputeAverageReprojectionError(const Map& map, const cv::Mat& cameraMatrix) {
     double total_error = 0.0;
@@ -114,8 +75,6 @@ double ComputeAverageReprojectionError(const Map& map, const cv::Mat& cameraMatr
     if (valid_obs == 0) return 0.0;
     return total_error / valid_obs;
 }
-
-const int ba_window_size = 3;  // Adjust based on performance; e.g., 5-15
 
 // New function to compute fundamental matrix from R, t, K
 cv::Mat computeFundamentalMatrix(const cv::Mat& R, const cv::Mat& t, const cv::Mat& K) {
@@ -163,352 +122,119 @@ double calculateAvgEpipolarDistance(const std::vector<Match2D2D>& pairs, const c
     return (count > 0) ? (total_dist / count) : 0.0;
 }
 
-// New function to visualize epipolar lines and points
-void visualizeEpipolarLines(const std::vector<Match2D2D>& pairs, const cv::Mat& F, cv::Mat img1, cv::Mat img2, const std::string& window_name) {
-    cv::Mat img1_color, img2_color;
-    cv::cvtColor(img1, img1_color, cv::COLOR_GRAY2BGR);
-    cv::cvtColor(img2, img2_color, cv::COLOR_GRAY2BGR);
-
-    // Collect points
-    std::vector<cv::Point2f> points1, points2;
-    for (const auto& pr : pairs) {
-        points1.push_back(cv::Point2f(static_cast<float>(pr.p0.x), static_cast<float>(pr.p0.y)));  // Assuming pt1/pt2 are double
-        points2.push_back(cv::Point2f(static_cast<float>(pr.p1.x), static_cast<float>(pr.p1.y)));
-    }
-
-    // Compute epipolar lines
-    std::vector<cv::Vec3f> lines1, lines2;
-    cv::computeCorrespondEpilines(points2, 2, F, lines1);  // Lines in img1 corresponding to points in img2
-    cv::computeCorrespondEpilines(points1, 1, F, lines2);  // Lines in img2 corresponding to points in img1
-
-    // Draw on img1: points and lines
-    for (size_t i = 0; i < points1.size(); ++i) {
-        // Draw point in img1
-        cv::circle(img1_color, points1[i], 3, cv::Scalar(0, 255, 0), -1);
-
-        // Draw epipolar line in img1 (for point in img2)
-        cv::Vec3f line = lines1[i];
-        cv::Point pt1(0, static_cast<int>(-line[2] / line[1]));
-        cv::Point pt2(img1_color.cols, static_cast<int>(-(line[2] + line[0] * img1_color.cols) / line[1]));
-        cv::line(img1_color, pt1, pt2, cv::Scalar(0, 0, 255), 1);
-    }
-
-    // Draw on img2: points and lines
-    for (size_t i = 0; i < points2.size(); ++i) {
-        // Draw point in img2
-        cv::circle(img2_color, points2[i], 3, cv::Scalar(0, 255, 0), -1);
-
-        // Draw epipolar line in img2 (for point in img1)
-        cv::Vec3f line = lines2[i];
-        cv::Point pt1(0, static_cast<int>(-line[2] / line[1]));
-        cv::Point pt2(img2_color.cols, static_cast<int>(-(line[2] + line[0] * img2_color.cols) / line[1]));
-        cv::line(img2_color, pt1, pt2, cv::Scalar(0, 0, 255), 1);
-    }
-
-    // Display side by side
-    cv::Mat combined;
-    cv::hconcat(img1_color, img2_color, combined);
-    cv::imshow(window_name, combined);
-    cv::waitKey(1);  // Brief display; adjust as needed
-}
 
 int main() {
-    SuperPointTRT sp;
-    LightGlueTRT lg;
-    slam_core::superpoint_lightglue_init(sp, lg);
-    Keypt2SubpxTRT k2s;
-    if (!k2s.init("../third_party/Keypt2Subpx/keypt2subpx_splg.onnx", "keypt2subpx_splg.engine")) {
-        std::cerr << "Failed to initialize Keypt2SubpxTRT" << std::endl;
-        return -1;
-    }
 
-    auto cameraMatrix = slam_core::load_camera_matrix(calibPath);
-    auto gtPoses = slam_core::load_poses(posesPath);
-    cv::Mat img0 = cv::imread(img_dir_path + "000000.png", cv::IMREAD_GRAYSCALE);
-    cv::Mat img1 = cv::imread(img_dir_path + "000001.png", cv::IMREAD_GRAYSCALE);
-    auto spRes0 = sp.runInference(img0, img0.rows, img0.cols);
-    auto spRes1 = sp.runInference(img1, img1.rows, img1.cols);
-    auto lgRes = lg.run_Direct_Inference(spRes0, spRes1);
-    Keypt2SubpxTRT::Result k2sRes = k2s.run_Direct_Inference(lgRes, img0, img1);
-    Keypt2SubpxTRT::Result R23;
-    // std::cout << "Number of refined matches: " << (lgRes.keypoints0[835 * 2 + 0]) << std::endl;
-    // std::cout << "Number of refined matches: " << (k2sRes.refined_keypt0[0]) << std::endl;
-    auto matches = slam_core::lightglue_score_filter(lgRes, k2sRes, match_thr);
-    if (matches.size() < 8) {
-        std::cerr << "Not enough matches for pose estimation." << std::endl;
-        return 1;
-    }
-    auto [R, t, mask] = slam_core::pose_estimator(matches, cameraMatrix);
-    auto inliersPairs = slam_core::pose_estimator_mask_filter(matches, mask);// std::vector<int> mapid;
-    // R = R.t();
-    // t = -R * t;
-    t = slam_core::adjust_translation_magnitude(gtPoses, t, 1);
-
-    cv::Mat F_bootstrap = computeFundamentalMatrix(R, t, cameraMatrix);
-    double avg_dist_bootstrap = calculateAvgEpipolarDistance(matches, F_bootstrap);
-    std::cout << "Bootstrap Average Epipolar Distance: " << avg_dist_bootstrap << " px" << std::endl;
-    // while(true) visualizeEpipolarLines(inliersPairs, F_bootstrap, img0, img1, "Bootstrap Epipolar Lines");
-
-    cv::Mat R1 = cv::Mat::eye(3, 3, CV_64F);
-    cv::Mat t1 = cv::Mat::zeros(3, 1, CV_64F);
-    auto [points3d, filteredPairs] = slam_core::triangulate_and_filter_3d_points(R1, t1, R, t, cameraMatrix, matches, 100.0, 0.5 );
-    
-    std::vector<ObsPairs> a;
-    slam_core::update_map_and_keyframe_data(map, img1, R, t, spRes1, points3d,
-                                            filteredPairs, spRes0, img0, a, true, true);
-
-    std::cout << "Camera Matrix:\n" << cameraMatrix << std::endl;
-    std::cout << "Image0: valid keypoints = " << spRes0.numValid << std::endl;
-    std::cout << "Image1: valid keypoints = " << spRes1.numValid << std::endl;
-
-    std::thread viewer_thread(slam_visualization::visualize_map_loop, std::ref(map), std::ref(map_mutex));
-
-
-    //std::this_thread::sleep_for(std::chrono::milliseconds(5000));
-    // ===================== PnP on next image (temp5.png) =====================
-    // const int start_idx = map.next_keyframe_id;     
-    const int start_idx = 2;            
-       
-    int prev_triangulated_frame = map.next_keyframe_id -1;
-    int run_window = -1;
-    for (int idx = start_idx; idx <= max_idx; ++idx) {
-        const int prev_kfid = map.next_keyframe_id - 1; 
-        
-        auto [img_cur, R_cur, t_cur, spRes_cur, restPairs, obsPairs,
-                skip] = slam_core::run_pnp(map, sp, lg, k2s, img_dir_path,
-                cameraMatrix, match_thr, map_match_thr, idx, map_match_window, false, gtPoses);
-        if(skip) continue;
-
-        // R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
-        //slam_core::refine_pose_with_g2o(R_cur, t_cur, spRes_cur, map_point_id, kp_index, map, cameraMatrix);
-        // R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
-        // t_cur = slam_core::adjust_translation_magnitude(gtPoses, t_cur, idx );
-
-        
-        double t_mag = std::abs(cv::norm(map.keyframes[prev_triangulated_frame].t) - cv::norm(t_cur));
-        
-        
-        
-        
-
-        cv::Mat Rc = R_cur.clone(); cv::Mat tc = t_cur.clone();
-        Rc = Rc.t();
-        tc = -Rc * tc;
-
-        double r_deg = rotationAngleErrorDeg(Rc, map.keyframes[prev_triangulated_frame].R);
-        std::cout << "R_DEG = " << r_deg << std::endl;
-
-        if(t_mag < mag_filter && r_deg < rot_filter) skip = true;
-        // Compare with GT
-        if (gtPoses.size() > idx) {
-            const cv::Mat T_wi = gtPoses[idx];
-            cv::Mat R_gt = T_wi(cv::Rect(0,0,3,3)).clone();
-            cv::Mat t_gt = T_wi(cv::Rect(3,0,1,3)).clone();
-
-            double rot_err = rotationAngleErrorDeg(Rc, R_gt);
-            double t_dir_err = angleBetweenVectorsDeg(tc, t_gt);
-            double t_mag_err = std::abs(cv::norm(tc) - cv::norm(t_gt));
-            std::cout << "[PnP-Loop] Frame " << idx << " | rot(deg): " << rot_err
-                    << " t_dir(deg): " << t_dir_err << " t_mag(m): " << t_mag_err << "\n";
-        }
-
-        cv::Mat R_prev = map.keyframes[prev_kfid].R.clone(); cv::Mat t_prev = map.keyframes[prev_kfid].t.clone();
-        R_prev = R_prev.t(); t_prev = -R_prev * t_prev;
-        // R_cur = R_cur.t(); t_cur = -R_cur * t_cur;
-        
-        auto [newPoints3D, newPairs] = slam_core::triangulate_and_filter_3d_points(
-            R_prev, t_prev, R_cur, t_cur, cameraMatrix, restPairs,
-            /*maxZ*/ 100.0, /*min_repoj_error*/ 0.1);
-        std::cout << "[PnP-Loop] Frame " << idx << " triangulated-new = " << newPoints3D.size() << "\n";
-
-        bool run_ba = false;
-        int window = 0;
-        
-        if(skip){
-            newPoints3D.clear();
-            newPairs.clear();
-            if(map.next_keyframe_id - prev_triangulated_frame > Full_ba_window_size + 10  && map.next_keyframe_id - run_window > Full_ba_window_size ){
-                run_ba = true;
-                window = map.next_keyframe_id - run_window; 
-                // run_window = map.next_keyframe_id;
-            }
-        }
-        else{
-            if(map.next_keyframe_id - run_window >= Full_ba_window_size){
-                run_ba = true;
-                window = map.next_keyframe_id - run_window; 
-                // run_window = map.next_keyframe_id;
-            }
-            prev_triangulated_frame = map.next_keyframe_id;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(map_mutex);
-            slam_core::update_map_and_keyframe_data(
-                map,
-                /*img_cur*/ img_cur,
-                /*R_cur*/   R_cur,
-                /*t_cur*/   t_cur,
-                /*spRes_cur*/ spRes_cur,
-                /*points3d*/ newPoints3D,
-                /*pairs*/    newPairs,
-                /*spRes_prev*/ spRes_cur,
-                /*img_prev*/  img_cur,  
-                /*map_point_obs_id*/ obsPairs,      
-                /*is_first_frame*/ false,
-                /*is_cur_kf*/  true
-            );
-        }
-        // {   
-        //     std::this_thread::sleep_for(std::chrono::milliseconds(5000));
-        // }
-       
-        
-        cv::Mat img1_color;
-        cv::cvtColor(img_cur, img1_color, cv::COLOR_GRAY2BGR);
-        const auto& kf2 = map.keyframes[map.next_keyframe_id - 1].sp_res;
-
-        for (const auto& pr : newPairs) {
-            float x = (float)kf2.keypoints[2 * pr.idx1];
-            float y = (float)kf2.keypoints[2 * pr.idx1 + 1];
-            cv::circle(img1_color, cv::Point2f(x, y), 2, cv::Scalar(255, 0, 0), -1, cv::LINE_AA);
-        }
-
-        for( auto i : obsPairs){
-            float x = (float)i.p1.x;
-            float y = (float)i.p1.y;
-            cv::circle(img1_color, cv::Point2f(x, y), 2, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
-        }
-        
-        cv::imshow("Inliers on Second Image", img1_color);
-        cv::waitKey(1);
-        std::cout << map.keyframes.size() << std::endl;
-
-        if(run_ba){
-            int ba_window = 0;
-            if(map.keyframes.size() >= (Full_ba_include_past_optimized_frame_size + window)){
-                ba_window = Full_ba_include_past_optimized_frame_size + window;
-            }
-            else ba_window = window;
-            auto done = slam_core::full_ba(map_mutex, map, cameraMatrix, ba_window);
-            if(done) run_window = map.next_keyframe_id - 1;
-            // prev_triangulated_frame = map.next_keyframe_id;
-        }
-
-        if (gtPoses.size() > idx) {
-            const cv::Mat T_wi = gtPoses[idx];
-            cv::Mat R_gt = T_wi(cv::Rect(0,0,3,3)).clone();
-            cv::Mat t_gt = T_wi(cv::Rect(3,0,1,3)).clone();
-
-            double rot_err = rotationAngleErrorDeg(map.keyframes[map.next_keyframe_id-1].R, R_gt);
-            double t_dir_err = angleBetweenVectorsDeg(map.keyframes[map.next_keyframe_id-1].t, t_gt);
-            double t_mag_err = std::abs(cv::norm(map.keyframes[map.next_keyframe_id-1].t) - cv::norm(t_gt));
-            std::cout << "[PnP-Loop] Frame " << idx << " | rot(deg): " << rot_err
-                    << " t_dir(deg): " << t_dir_err << " t_mag(m): " << t_mag_err << "\n";
-        }
-        
-    }
-
-    {
-
-        int count_low_error_high_obs = 0;
-        int count_low_error_low_obs = 0;
-        int count_high_error_high_obs = 0;
-        int count_high_error_low_obs = 0;
-
-        const double error_threshold = 1.0;  // Pixels
-        const int obs_threshold = 3;
-
-        for (const auto& [point_id, point] : map.map_points) {
-            if (point.obs.empty() || point.is_bad) continue;
-
-            // Count observations
-            int num_obs = point.obs.size();
-
-            // Compute average reprojection error
-            double total_error = 0.0;
-            int valid_obs = 0;
-            cv::Mat position_mat = (cv::Mat_<double>(3,1) << point.position.x, point.position.y, point.position.z);
-
-            for (const auto& obs : point.obs) {
-                int kfid = obs.keyframe_id;
-                if (map.keyframes.find(kfid) == map.keyframes.end()) continue;
-
-                const auto& kf = map.keyframes.at(kfid);
-                
-                cv::Mat R1 = kf.R.clone();
-                cv::Mat t1 = kf.t.clone();
-                R1 = R1.t();
-                t1 = -R1 * t1;
-                // Project 3D point to camera coordinates (assuming R/t are camera-to-world)
-                cv::Mat camera_point = R1 * position_mat + t1;
-                if (camera_point.at<double>(2) <= 0) continue;  // Behind camera
-
-                // Normalize
-                double z = camera_point.at<double>(2);
-                cv::Mat normalized = (cv::Mat_<double>(3,1) << camera_point.at<double>(0)/z, camera_point.at<double>(1)/z, 1.0);
-
-                // Apply camera matrix for pixel coordinates
-                cv::Mat projected_mat = cameraMatrix * normalized;
-                cv::Point2d projected(projected_mat.at<double>(0), projected_mat.at<double>(1));
-
-                // Reprojection error
-                double error = cv::norm(projected - obs.point2D);
-                
-                //std::cout << "Error " << valid_obs << " : " << error << std::endl;
-                total_error += error;
-                valid_obs++;
-            }
-
-            if (valid_obs == 0) continue;
-
-            double avg_error = total_error / valid_obs;
-
-            // Categorize
-            bool is_low_error = (avg_error < error_threshold);
-            bool is_high_obs = (num_obs >= obs_threshold);
-
-            if (is_low_error && is_high_obs) {
-                count_low_error_high_obs++;
-            } else if (is_low_error && !is_high_obs) {
-                count_low_error_low_obs++;
-            } else if (!is_low_error && is_high_obs) {
-                count_high_error_high_obs++;
-            } else {
-                count_high_error_low_obs++;
-            }
-        }
-
-        // Print counts
-        std::cout << "Map Point Analysis:" << std::endl;
-        std::cout << " - Low error (< " << error_threshold << " px) + High obs (>= " << obs_threshold << "): " << count_low_error_high_obs << std::endl;
-        std::cout << " - Low error (< " << error_threshold << " px) + Low obs (< " << obs_threshold << "): " << count_low_error_low_obs << std::endl;
-        std::cout << " - High error (>= " << error_threshold << " px) + High obs (>= " << obs_threshold << "): " << count_high_error_high_obs << std::endl;
-        std::cout << " - High error (>= " << error_threshold << " px) + Low obs (< " << obs_threshold << "): " << count_high_error_low_obs << std::endl;
-        std::cout << "Total map points analyzed: " << map.map_points.size() << std::endl;
-
-        std::cout << "Frame 0 :-" << std::endl;
-        std::cout << " R : " << map.keyframes[0].R << std::endl;
-        std::cout << " t : " << map.keyframes[0].t << std::endl;
-        std::cout << "Frame 1 :-" << std::endl;
-        std::cout << " R : " << map.keyframes[1].R << std::endl;
-        std::cout << " t : " << map.keyframes[1].t << std::endl;
-
-        {
-            const cv::Mat T_wi = gtPoses[1];
-            cv::Mat R_gt = T_wi(cv::Rect(0,0,3,3)).clone();
-            cv::Mat t_gt = T_wi(cv::Rect(3,0,1,3)).clone();
-
-            double rot_err = rotationAngleErrorDeg(map.keyframes[1].R, R_gt);
-            double t_dir_err = angleBetweenVectorsDeg(map.keyframes[1].t, t_gt);
-            double t_mag_err = std::abs(cv::norm(map.keyframes[1].t) - cv::norm(t_gt));
-            std::cout << "[PnP-Loop] Frame " << 1 << " | rot(deg): " << rot_err
-                    << " t_dir(deg): " << t_dir_err << " t_mag(m): " << t_mag_err << "\n";
-        }
-    }
-
-
+    std::thread viewer_thread(slam_visualization::visualize_map_loop, std::ref(slam_types::map), std::ref(slam_types::map_mutex));
+    std::thread tracking_thread(thread_pool::tracking_thread);
+    // slam_types::run_tracking.notify_one();
+    std::thread local_ba_thread(thread_pool::map_optimizing_thread);
     viewer_thread.join();
+    
+    tracking_thread.join();
+    local_ba_thread.join();
+
+    // //std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+        
+    // }
+
+    // {
+
+    //     int count_low_error_high_obs = 0;
+    //     int count_low_error_low_obs = 0;
+    //     int count_high_error_high_obs = 0;
+    //     int count_high_error_low_obs = 0;
+
+    //     const double error_threshold = 1.0;  // Pixels
+    //     const int obs_threshold = 3;
+
+    //     for (const auto& [point_id, point] : map.map_points) {
+    //         if (point.obs.empty() || point.is_bad) continue;
+
+    //         // Count observations
+    //         int num_obs = point.obs.size();
+
+    //         // Compute average reprojection error
+    //         double total_error = 0.0;
+    //         int valid_obs = 0;
+    //         cv::Mat position_mat = (cv::Mat_<double>(3,1) << point.position.x, point.position.y, point.position.z);
+
+    //         for (const auto& obs : point.obs) {
+    //             int kfid = obs.keyframe_id;
+    //             if (map.keyframes.find(kfid) == map.keyframes.end()) continue;
+
+    //             const auto& kf = map.keyframes.at(kfid);
+                
+    //             cv::Mat R1 = kf.R.clone();
+    //             cv::Mat t1 = kf.t.clone();
+    //             R1 = R1.t();
+    //             t1 = -R1 * t1;
+    //             // Project 3D point to camera coordinates (assuming R/t are camera-to-world)
+    //             cv::Mat camera_point = R1 * position_mat + t1;
+    //             if (camera_point.at<double>(2) <= 0) continue;  // Behind camera
+
+    //             // Normalize
+    //             double z = camera_point.at<double>(2);
+    //             cv::Mat normalized = (cv::Mat_<double>(3,1) << camera_point.at<double>(0)/z, camera_point.at<double>(1)/z, 1.0);
+
+    //             // Apply camera matrix for pixel coordinates
+    //             cv::Mat projected_mat = cameraMatrix * normalized;
+    //             cv::Point2d projected(projected_mat.at<double>(0), projected_mat.at<double>(1));
+
+    //             // Reprojection error
+    //             double error = cv::norm(projected - obs.point2D);
+                
+    //             //std::cout << "Error " << valid_obs << " : " << error << std::endl;
+    //             total_error += error;
+    //             valid_obs++;
+    //         }
+
+    //         if (valid_obs == 0) continue;
+
+    //         double avg_error = total_error / valid_obs;
+
+    //         // Categorize
+    //         bool is_low_error = (avg_error < error_threshold);
+    //         bool is_high_obs = (num_obs >= obs_threshold);
+
+    //         if (is_low_error && is_high_obs) {
+    //             count_low_error_high_obs++;
+    //         } else if (is_low_error && !is_high_obs) {
+    //             count_low_error_low_obs++;
+    //         } else if (!is_low_error && is_high_obs) {
+    //             count_high_error_high_obs++;
+    //         } else {
+    //             count_high_error_low_obs++;
+    //         }
+    //     }
+
+    //     // Print counts
+    //     std::cout << "Map Point Analysis:" << std::endl;
+    //     std::cout << " - Low error (< " << error_threshold << " px) + High obs (>= " << obs_threshold << "): " << count_low_error_high_obs << std::endl;
+    //     std::cout << " - Low error (< " << error_threshold << " px) + Low obs (< " << obs_threshold << "): " << count_low_error_low_obs << std::endl;
+    //     std::cout << " - High error (>= " << error_threshold << " px) + High obs (>= " << obs_threshold << "): " << count_high_error_high_obs << std::endl;
+    //     std::cout << " - High error (>= " << error_threshold << " px) + Low obs (< " << obs_threshold << "): " << count_high_error_low_obs << std::endl;
+    //     std::cout << "Total map points analyzed: " << map.map_points.size() << std::endl;
+
+    //     std::cout << "Frame 0 :-" << std::endl;
+    //     std::cout << " R : " << map.keyframes[0].R << std::endl;
+    //     std::cout << " t : " << map.keyframes[0].t << std::endl;
+    //     std::cout << "Frame 1 :-" << std::endl;
+    //     std::cout << " R : " << map.keyframes[1].R << std::endl;
+    //     std::cout << " t : " << map.keyframes[1].t << std::endl;
+
+    //     {
+    //         const cv::Mat T_wi = gtPoses[1];
+    //         cv::Mat R_gt = T_wi(cv::Rect(0,0,3,3)).clone();
+    //         cv::Mat t_gt = T_wi(cv::Rect(3,0,1,3)).clone();
+
+    //         double rot_err = rotationAngleErrorDeg(map.keyframes[1].R, R_gt);
+    //         double t_dir_err = angleBetweenVectorsDeg(map.keyframes[1].t, t_gt);
+    //         double t_mag_err = std::abs(cv::norm(map.keyframes[1].t) - cv::norm(t_gt));
+    //         std::cout << "[PnP-Loop] Frame " << 1 << " | rot(deg): " << rot_err
+    //                 << " t_dir(deg): " << t_dir_err << " t_mag(m): " << t_mag_err << "\n";
+    //     }
+    // }
 
     return 0;
 }

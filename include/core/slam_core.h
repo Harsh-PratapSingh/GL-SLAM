@@ -16,6 +16,10 @@ constexpr int MODEL_IMAGE_SIZE = 1024;
 
 namespace slam_core {
 
+    double angleBetweenVectorsDeg(const cv::Mat& a, const cv::Mat& b);
+
+    double rotationAngleErrorDeg(const cv::Mat& R_est, const cv::Mat& R_gt);
+
     cv::Mat load_camera_matrix(const std::string& calibPath);
 
     std::vector<cv::Mat> load_poses(const std::string& path);
