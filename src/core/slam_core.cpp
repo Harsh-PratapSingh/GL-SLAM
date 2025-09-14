@@ -79,7 +79,7 @@ namespace slam_core {
 
         sp.setWorkspaceSizeBytes(2ULL << 30);
         sp.setMaxKeypoints(2048);
-        sp.setScoreThreshold(0.05f);
+        sp.setScoreThreshold(0.1f);
         const int spH = 376;
         const int spW = 1241;
         if (!sp.init("../third_party/Superpoint_Lightglue/superpoint_2048.onnx", "superpoint_2048.engine", spH, spW)) {
@@ -695,7 +695,7 @@ namespace slam_core {
     };
 
     bool full_ba(std::mutex& map_mutex, Map& map, cv::Mat& cameraMatrix, int window){
-        if(map.keyframes.size() < window) return false;
+        if(map.keyframes.size() < window || window == 1) return false;
         std::vector<double> camera_params;
         std::vector<double> point_params;
         std::unordered_map<int, int> kf_to_param_idx;
@@ -760,7 +760,7 @@ namespace slam_core {
                 // std::cout << "cam_idx: " << cam_idx << std::endl;
 
                 ceres::CostFunction* cost_function = ReprojectionError::Create(obs.point2D, cameraMatrix);
-                ceres::LossFunction* loss_function = new ceres::HuberLoss(0.01);  // Scale 1.0; adjust based on expected error magnitude (e.g., pixels)
+                ceres::LossFunction* loss_function = new ceres::CauchyLoss(1.0);  // Scale 1.0; adjust based on expected error magnitude (e.g., pixels)
                 problem.AddResidualBlock(cost_function, loss_function,
                                         &camera_params[cam_idx * cam_param_size],
                                         &point_params[point_idx * point_param_size]);
@@ -790,16 +790,19 @@ namespace slam_core {
         options.linear_solver_type = ceres::SPARSE_SCHUR;  // Or SPARSE_SCHUR for larger problems
         options.preconditioner_type = ceres::CLUSTER_JACOBI;
         options.minimizer_progress_to_stdout = true;
-        options.max_num_iterations = 50; // increase from default ~50
-        options.num_threads = 10;  // Adjust to your CPU cores (e.g., std::thread::hardware_concurrency())
+        options.max_num_iterations = 30; // increase from default ~50
+        options.num_threads = 16;  // Adjust to your CPU cores (e.g., std::thread::hardware_concurrency())
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         // std::cout << summary.FullReport() << std::endl;
 
+
+        cv::Mat R_before = slam_types::map.keyframes[slam_types::run_window].R.clone();
+        cv::Mat t_before = slam_types::map.keyframes[slam_types::run_window].t.clone();
         std::cout << 7 << std::endl;
         {
             std::lock_guard<std::mutex> tracking_lock(slam_types::tracking_mutex);
-            std::lock_guard<std::mutex> lk(map_mutex);
+            std::lock_guard<std::mutex> lk(slam_types::map_mutex);
             for (const auto& [kfid, idx] : kf_to_param_idx) {
                 double* cam = &camera_params[idx * cam_param_size];
                 cv::Mat angle_axis = (cv::Mat_<double>(3,1) << cam[0], cam[1], cam[2]);
@@ -817,5 +820,34 @@ namespace slam_core {
         }
         return true;
 
+    }
+
+    cv::Mat ProjectToSO3(const cv::Mat& R_in) {
+        cv::Mat U, W, Vt;
+        cv::SVD::compute(R_in, W, U, Vt);
+        cv::Mat R = U * Vt;
+        // Enforce det(R)=+1
+        double det = cv::determinant(R);
+        if (det < 0.0) {
+            // Flip last column of U and recompute
+            U.col(2) *= -1.0;
+            R = U * Vt;
+        }
+        return R;
+    }
+
+    void ComputeDeltaPose_SO3(const cv::Mat& Rb_in, const cv::Mat& tb,
+                                    const cv::Mat& Ra_in, const cv::Mat& ta,
+                                    cv::Mat& dR_out, cv::Mat& dt_out) {
+        // Project before/after to SO(3) to remove numerical drift
+        cv::Mat Rb = ProjectToSO3(Rb_in);
+        cv::Mat Ra = ProjectToSO3(Ra_in);
+        // Clean Delta R
+        cv::Mat dR = Ra * Rb.t();
+        dR = ProjectToSO3(dR);
+        // Delta t
+        cv::Mat dt = ta - dR * tb;
+        dR_out = dR.clone();
+        dt_out = dt.clone();
     }
 }
