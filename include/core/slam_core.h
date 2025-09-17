@@ -8,11 +8,8 @@
 #include "core/superpoint.h"
 #include "core/lightglue.h"
 #include "core/keypt2subpx.h"
+#include <unordered_set>
 
-constexpr float SCORE_THRESHOLD = 0.5f;
-constexpr int IMAGE_WIDTH = 1241;
-constexpr int IMAGE_HEIGHT = 376;
-constexpr int MODEL_IMAGE_SIZE = 1024;
 
 namespace slam_core {
 
@@ -66,5 +63,9 @@ namespace slam_core {
     void ComputeDeltaPose_SO3(const cv::Mat& Rb_in, const cv::Mat& tb,
                                     const cv::Mat& Ra_in, const cv::Mat& ta,
                                     cv::Mat& dR_out, cv::Mat& dt_out);
+
+    void post_ba_map_update_for_new_keyframes(cv::Mat& R_before, cv::Mat& t_before);
+
+    void post_ba_map_point_culling(cv::Mat& cameraMatrix);
 
 }

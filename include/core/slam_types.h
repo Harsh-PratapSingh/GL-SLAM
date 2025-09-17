@@ -89,10 +89,12 @@ namespace slam_types {
     extern std::condition_variable cv_local_ba;     
     extern std::condition_variable run_tracking; 
     extern bool tracking_frame;
-    extern bool local_ba_writing;
     extern bool local_ba_start; 
     extern int local_ba_window;
     extern bool local_ba_done; 
+
+    extern double reprog_error_threshold_for_old_points;
+    extern int obs_count_threshold_for_old_points;
 
     extern std::vector<int> mpid_to_correct;
     extern std::vector<int> kpid_to_correct;

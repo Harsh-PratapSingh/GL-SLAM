@@ -71,9 +71,7 @@ namespace thread_pool {
         for (int idx = 2; idx <= slam_types::max_idx; ++idx) 
         {   
             std::unique_lock<std::mutex> tracking_lock(slam_types::tracking_mutex);
-            // slam_types::run_tracking.wait(tracking_lock, [] { return (!slam_types::local_ba_writing); });
             std::cout << "TRACKING" << std::endl;
-            slam_types::tracking_frame = true;
             // const int prev_kfid = slam_types::map.next_keyframe_id - 1; 
             double t_mag_err;
             if (gtPoses.size() > idx) {
@@ -127,6 +125,7 @@ namespace thread_pool {
             // if (inliersPairs.size() > 0) {
             //     std::cerr << "Inlier Pairs" << inliersPairs.size() << std::endl;
             // }
+
             int used3d = 0, skipped_no3d = 0;
             int x = 0;
 
@@ -140,10 +139,12 @@ namespace thread_pool {
                 int mpid = kf_prev.kp_to_mpid[m.idx0];
                 if(mpid > -1){
                     obsPairs.push_back({mpid,m.idx1,m.p1});
+                    used3d++;
                 }else if (map_matches.find(m.idx1) != map_matches.end()){
                     x++;
                     mpid = map_matches[m.idx1].mpid;
                     obsPairs.push_back({mpid,m.idx1,m.p1});
+                    used3d++;
                 }else if (mptr[k]){
                     restPairs.push_back(m);
                     skipped_no3d++;
@@ -166,6 +167,7 @@ namespace thread_pool {
             t_cur = -R_cur * t_cur;
             // t_cur = slam_core::adjust_translation_magnitude(gtPoses, t_cur, idx);
 
+            
 
             cv::Mat Rc = R_cur.clone(); cv::Mat tc = t_cur.clone();
             Rc = Rc.t();
@@ -233,7 +235,6 @@ namespace thread_pool {
                 );
             }
             tracking_lock.unlock();
-            slam_types::tracking_frame = false;
 
             if (gtPoses.size() > idx) {
                 const cv::Mat T_wi = gtPoses[idx];
@@ -274,7 +275,6 @@ namespace thread_pool {
             cv::waitKey(1);
 
             if(run_ba){
-                // tracking_lock.unlock();
                 std::unique_lock<std::mutex> local_ba_lock(slam_types::local_ba_mutex);
                 
                 int ba_window = 0;
@@ -290,8 +290,8 @@ namespace thread_pool {
                 slam_types::run_window = slam_types::map.next_keyframe_id - 1;
                 slam_types::kpid_to_correct.clear();
                 slam_types::mpid_to_correct.clear();
-                // std::cout << "Run_window = " << slam_types::run_window << std::endl;
-                // std::cout << "ba_window = " << ba_window << std::endl;
+                std::cout << "Run_window = " << slam_types::run_window << std::endl;
+                std::cout << "ba_window = " << ba_window << std::endl;
                 slam_types::local_ba_start = true;
                 slam_types::cv_local_ba.notify_one();
             }
@@ -308,68 +308,72 @@ namespace thread_pool {
         {
             std::unique_lock<std::mutex> local_ba_lock(slam_types::local_ba_mutex);
             slam_types::cv_local_ba.wait(local_ba_lock, [] { return slam_types::local_ba_start; });
-            cv::Mat R_before = slam_types::map.keyframes[slam_types::run_window].R.clone();
-            cv::Mat t_before = slam_types::map.keyframes[slam_types::run_window].t.clone();
+            
             slam_types::local_ba_done = slam_core::full_ba(slam_types::map_mutex, slam_types::map, cameraMatrix, slam_types::local_ba_window);
-            {
-                std::lock_guard<std::mutex> tracking_lock(slam_types::tracking_mutex);
-                std::lock_guard<std::mutex> lk(slam_types::map_mutex);
-
-                std::cout << "STOP" << std::endl;
-                cv::Mat R_after = slam_types::map.keyframes[slam_types::run_window].R.clone();
-                cv::Mat t_after = slam_types::map.keyframes[slam_types::run_window].t.clone();
-                cv::Mat delta_R;
-                cv::Mat delta_t;
-                slam_core::ComputeDeltaPose_SO3(R_before, t_before, R_after, t_after, delta_R, delta_t);  // clean Delta
-                // std::cout << "ba_last_R_before = " << R_before << std::endl;
-                // std::cout << "ba_last_t_before = " << t_before << std::endl;
-                // std::cout << "ba_last_R_after = " << R_after << std::endl;
-                // std::cout << "ba_last_t_after = " << t_after << std::endl;
-                // std::cout << "Delta R = " << delta_R <<std::endl;
-                // std::cout << "Delta t = " << delta_t <<std::endl;
-                while(!slam_types::mpid_to_correct.empty()){
-                        auto mpid_new = slam_types::mpid_to_correct.back();
-        
-                        cv::Point3d point = slam_types::map.map_points[mpid_new].position;
-                        cv::Mat point_mat = (cv::Mat_<double>(3, 1) << point.x, point.y, point.z);
-                        cv::Mat updated_point_mat = delta_R * point_mat + delta_t;
-                        cv::Point3d updated_point(updated_point_mat.at<double>(0), 
-                                                updated_point_mat.at<double>(1), 
-                                                updated_point_mat.at<double>(2));
-                        
-                        slam_types::map.map_points[mpid_new].position = updated_point;
-
-                        slam_types::mpid_to_correct.pop_back();
-                }
-                while(!slam_types::kpid_to_correct.empty()){  
-                        auto kpid_new = slam_types::kpid_to_correct.back();
-                    
-                        cv::Mat R_new = slam_types::map.keyframes[kpid_new].R.clone();
-                        cv::Mat t_new = slam_types::map.keyframes[kpid_new].t.clone();
-                        std::cout << "R_before = " << R_new << std::endl;
-                        std::cout << "t_before = " << t_new << std::endl;
-                        cv::Mat Newr = delta_R * R_new;
-                        
-                        // R_new_updated = R_new_updated.t();
-                        cv::Mat t_new_updated = delta_R * t_new + delta_t;
-                        delta_R.convertTo(delta_R, CV_64F);
-                        R_new.convertTo(R_new, CV_64F);
-                        cv::Mat R_new_updated = delta_R * R_new;
-                        std::cout << "R_updated = " << R_new_updated << std::endl;
-                        std::cout << "t_updated = " << t_new_updated << std::endl;
-
-                        
-                        slam_types::map.keyframes[kpid_new].R = R_new_updated;
-                        slam_types::map.keyframes[kpid_new].t = t_new_updated;
-                        std::cout << "kpid_new = " << kpid_new << std::endl;
-
-                        slam_types::kpid_to_correct.pop_back();
-                }
-                
-                std::cout << "DONE" << std::endl;
-            }
+            
             // std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             slam_types::local_ba_start = false;
+
+            // //Apply Map Point Culling here - just make it a bad point so that It is not further optimized or used
+            // int culled_points = 0;
+            // std::unordered_set<int> mpids;
+            // for(int i = (slam_types::run_window - slam_types::local_ba_window); i <= (slam_types::run_window - 4); ++i) 
+            // {
+            //     if(i == -1) continue;
+            //     const auto& kf = slam_types::map.keyframes[i];
+            //     for(auto& mp : kf.map_point_ids){
+            //         const int earliest_kfid = slam_types::map.map_points[mp].obs.front().keyframe_id;
+            //         if(earliest_kfid == i) mpids.insert(mp);
+            //     } 
+            //     std::cout << "keyframe to cull mpid = " << i << std::endl;
+            //     std::cout << "map point to check size = " << mpids.size() << std::endl;
+            // }
+            // for (int id : mpids) 
+            // {
+            //     auto& mp = slam_types::map.map_points[id];
+            //     if (mp.is_bad) continue;
+
+            //     double total_error = 0.0;
+            //     int valid_obs = 0;
+            //     cv::Mat position_mat = (cv::Mat_<double>(3,1) << mp.position.x, mp.position.y, mp.position.z);
+            //     for (const auto& obs : mp.obs) {
+            //         const int kfid = obs.keyframe_id;
+                                        
+            //         const auto& kf = slam_types::map.keyframes.at(kfid);
+
+            //         cv::Mat R1 = kf.R.clone();
+            //         cv::Mat t1 = kf.t.clone();
+            //         R1 = R1.t();
+            //         t1 = -R1 * t1;
+
+            //         cv::Mat camera_point = R1 * position_mat + t1;
+            //         if (camera_point.at<double>(2) <= 0)
+            //         {
+            //             mp.is_bad = true;
+            //             break;
+            //         }
+
+            //         double z = camera_point.at<double>(2);
+            //         cv::Mat normalized = (cv::Mat_<double>(3,1) << camera_point.at<double>(0)/z, camera_point.at<double>(1)/z, 1.0);
+
+            //         cv::Mat projected_mat = cameraMatrix * normalized;
+            //         cv::Point2d projected(projected_mat.at<double>(0), projected_mat.at<double>(1));
+
+            //         double error = cv::norm(projected - obs.point2D);
+            //         total_error += error;
+            //         valid_obs++;
+            //     }
+            //     if (mp.is_bad) continue;
+            //     double avg_error = total_error/valid_obs;
+            //     if(valid_obs < slam_types::obs_count_threshold_for_old_points || avg_error > slam_types::reprog_error_threshold_for_old_points) 
+            //     {
+            //         mp.is_bad = true;
+            //         culled_points++;
+            //     }
+
+            // }
+            // std::cout << "bad point size = " << culled_points << std::endl;
+
 
         }
     }

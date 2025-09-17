@@ -28,11 +28,13 @@ namespace slam_types {
 
     std::condition_variable cv_local_ba; 
     std::condition_variable run_tracking;
-    bool tracking_frame = true;
-    bool local_ba_writing = false;     
+    bool tracking_frame = true;   
     bool local_ba_start = false; 
     int local_ba_window = 0;
     bool local_ba_done = false; 
+
+    double reprog_error_threshold_for_old_points = 1.0f;
+    int obs_count_threshold_for_old_points = 3;
 
     std::vector<int> mpid_to_correct;
     std::vector<int> kpid_to_correct;

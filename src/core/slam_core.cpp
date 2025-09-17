@@ -7,7 +7,7 @@
 #include <iostream>
 #include <sstream>
 #include <fstream>
-#include <unordered_set>
+
 #include <memory> 
 
 #include <g2o/solvers/eigen/linear_solver_eigen.h> 
@@ -791,7 +791,7 @@ namespace slam_core {
         options.preconditioner_type = ceres::CLUSTER_JACOBI;
         options.minimizer_progress_to_stdout = true;
         options.max_num_iterations = 30; // increase from default ~50
-        options.num_threads = 16;  // Adjust to your CPU cores (e.g., std::thread::hardware_concurrency())
+        options.num_threads = 8;  // Adjust to your CPU cores (e.g., std::thread::hardware_concurrency())
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         // std::cout << summary.FullReport() << std::endl;
@@ -817,9 +817,12 @@ namespace slam_core {
                 map.map_points[point_id].position = cv::Point3d(pt[0], pt[1], pt[2]);
             }
             std::cout << 9 << std::endl;
+            post_ba_map_update_for_new_keyframes(R_before, t_before);
+            std::cout << 10 << std::endl;
         }
+        post_ba_map_point_culling(cameraMatrix);
+        std::cout << 11 << std::endl;
         return true;
-
     }
 
     cv::Mat ProjectToSO3(const cv::Mat& R_in) {
@@ -850,4 +853,127 @@ namespace slam_core {
         dR_out = dR.clone();
         dt_out = dt.clone();
     }
+
+    void post_ba_map_update_for_new_keyframes(cv::Mat& R_before, cv::Mat& t_before)
+    {
+        
+        std::cout << "STOP" << std::endl;
+        cv::Mat R_after = slam_types::map.keyframes[slam_types::run_window].R.clone();
+        cv::Mat t_after = slam_types::map.keyframes[slam_types::run_window].t.clone();
+        cv::Mat delta_R;
+        cv::Mat delta_t;
+        slam_core::ComputeDeltaPose_SO3(R_before, t_before, R_after, t_after, delta_R, delta_t);  // clean Delta
+        // std::cout << "ba_last_R_before = " << R_before << std::endl;
+        // std::cout << "ba_last_t_before = " << t_before << std::endl;
+        // std::cout << "ba_last_R_after = " << R_after << std::endl;
+        // std::cout << "ba_last_t_after = " << t_after << std::endl;
+        // std::cout << "Delta R = " << delta_R <<std::endl;
+        // std::cout << "Delta t = " << delta_t <<std::endl;
+        while(!slam_types::mpid_to_correct.empty())
+        {
+                auto mpid_new = slam_types::mpid_to_correct.back();
+
+                cv::Point3d point = slam_types::map.map_points[mpid_new].position;
+                cv::Mat point_mat = (cv::Mat_<double>(3, 1) << point.x, point.y, point.z);
+                cv::Mat updated_point_mat = delta_R * point_mat + delta_t;
+                cv::Point3d updated_point(updated_point_mat.at<double>(0), 
+                                        updated_point_mat.at<double>(1), 
+                                        updated_point_mat.at<double>(2));
+                
+                slam_types::map.map_points[mpid_new].position = updated_point;
+
+                slam_types::mpid_to_correct.pop_back();
+        }
+        while(!slam_types::kpid_to_correct.empty())
+        {  
+                auto kpid_new = slam_types::kpid_to_correct.back();
+            
+                cv::Mat R_new = slam_types::map.keyframes[kpid_new].R.clone();
+                cv::Mat t_new = slam_types::map.keyframes[kpid_new].t.clone();
+                // std::cout << "R_before = " << R_new << std::endl;
+                // std::cout << "t_before = " << t_new << std::endl;
+                cv::Mat Newr = delta_R * R_new;
+                
+                // R_new_updated = R_new_updated.t();
+                cv::Mat t_new_updated = delta_R * t_new + delta_t;
+                delta_R.convertTo(delta_R, CV_64F);
+                R_new.convertTo(R_new, CV_64F);
+                cv::Mat R_new_updated = delta_R * R_new;
+                // std::cout << "R_updated = " << R_new_updated << std::endl;
+                // std::cout << "t_updated = " << t_new_updated << std::endl;
+
+                
+                slam_types::map.keyframes[kpid_new].R = R_new_updated;
+                slam_types::map.keyframes[kpid_new].t = t_new_updated;
+                // std::cout << "kpid_new = " << kpid_new << std::endl;
+
+                slam_types::kpid_to_correct.pop_back();
+        }
+        
+        std::cout << "DONE" << std::endl;
+    }
+
+    void post_ba_map_point_culling(cv::Mat& cameraMatrix)
+    {
+        //Apply Map Point Culling here - just make it a bad point so that It is not further optimized or used
+        int culled_points = 0;
+        std::unordered_set<int> mpids;
+        for(int i = (slam_types::run_window - slam_types::local_ba_window); i <= (slam_types::run_window - 4); ++i) 
+        {
+            if(i == -1) continue;
+            const auto& kf = slam_types::map.keyframes[i];
+            for(auto& mp : kf.map_point_ids){
+                const int earliest_kfid = slam_types::map.map_points[mp].obs.front().keyframe_id;
+                if(earliest_kfid == i) mpids.insert(mp);
+            } 
+            std::cout << "keyframe to cull mpid = " << i << std::endl;
+            std::cout << "map point to check size = " << mpids.size() << std::endl;
+        }
+        for (int id : mpids) 
+        {
+            auto& mp = slam_types::map.map_points[id];
+            if (mp.is_bad) continue;
+
+            double total_error = 0.0;
+            int valid_obs = 0;
+            cv::Mat position_mat = (cv::Mat_<double>(3,1) << mp.position.x, mp.position.y, mp.position.z);
+            for (const auto& obs : mp.obs) {
+                const int kfid = obs.keyframe_id;
+                                    
+                const auto& kf = slam_types::map.keyframes.at(kfid);
+
+                cv::Mat R1 = kf.R.clone();
+                cv::Mat t1 = kf.t.clone();
+                R1 = R1.t();
+                t1 = -R1 * t1;
+
+                cv::Mat camera_point = R1 * position_mat + t1;
+                if (camera_point.at<double>(2) <= 0)
+                {
+                    mp.is_bad = true;
+                    break;
+                }
+
+                double z = camera_point.at<double>(2);
+                cv::Mat normalized = (cv::Mat_<double>(3,1) << camera_point.at<double>(0)/z, camera_point.at<double>(1)/z, 1.0);
+
+                cv::Mat projected_mat = cameraMatrix * normalized;
+                cv::Point2d projected(projected_mat.at<double>(0), projected_mat.at<double>(1));
+
+                double error = cv::norm(projected - obs.point2D);
+                total_error += error;
+                valid_obs++;
+            }
+            if (mp.is_bad) continue;
+            double avg_error = total_error/valid_obs;
+            if(valid_obs < slam_types::obs_count_threshold_for_old_points || avg_error > slam_types::reprog_error_threshold_for_old_points) 
+            {
+                mp.is_bad = true;
+                culled_points++;
+            }
+
+        }
+        std::cout << "bad point size = " << culled_points << std::endl;
+    }
+
 }
