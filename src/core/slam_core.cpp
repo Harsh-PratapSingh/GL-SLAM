@@ -820,8 +820,8 @@ namespace slam_core {
             post_ba_map_update_for_new_keyframes(R_before, t_before);
             std::cout << 10 << std::endl;
         }
-        // post_ba_map_point_culling(cameraMatrix);
-        // std::cout << 11 << std::endl;
+        post_ba_map_point_culling(cameraMatrix);
+        std::cout << 11 << std::endl;
         return true;
     }
 

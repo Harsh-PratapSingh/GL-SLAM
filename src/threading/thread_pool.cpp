@@ -126,6 +126,8 @@ namespace thread_pool {
             //     std::cerr << "Inlier Pairs" << inliersPairs.size() << std::endl;
             // }
             
+            std::vector<cv::Point3d> p3d;
+            std::vector<cv::Point2d> p2d;
             
             int used3d = 0, skipped_no3d = 0;
             int x = 0;
@@ -141,11 +143,16 @@ namespace thread_pool {
                 if(mpid > -1){
                     obsPairs.push_back({mpid,m.idx1,m.p1});
                     used3d++;
+                    
+                    p3d.emplace_back(slam_types::map.map_points[mpid].position);
+                    p2d.emplace_back(m.p1);
+                    
                 } else if (map_matches.find(m.idx1) != map_matches.end()){
                     x++;
                     mpid = map_matches[m.idx1].mpid;
                     obsPairs.push_back({mpid,m.idx1,m.p1});
                     used3d++;
+                    
                 }else if (mptr[k]){
                     restPairs.push_back(m);
                     skipped_no3d++;
