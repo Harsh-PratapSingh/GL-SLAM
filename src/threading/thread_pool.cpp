@@ -125,7 +125,8 @@ namespace thread_pool {
             // if (inliersPairs.size() > 0) {
             //     std::cerr << "Inlier Pairs" << inliersPairs.size() << std::endl;
             // }
-
+            
+            
             int used3d = 0, skipped_no3d = 0;
             int x = 0;
 
@@ -140,7 +141,7 @@ namespace thread_pool {
                 if(mpid > -1){
                     obsPairs.push_back({mpid,m.idx1,m.p1});
                     used3d++;
-                }else if (map_matches.find(m.idx1) != map_matches.end()){
+                } else if (map_matches.find(m.idx1) != map_matches.end()){
                     x++;
                     mpid = map_matches[m.idx1].mpid;
                     obsPairs.push_back({mpid,m.idx1,m.p1});
@@ -161,13 +162,15 @@ namespace thread_pool {
             // std::cout << "t_prev_kfid = " << t_prev << std::endl;
             cv::Mat R_cur = R_prev * R;
             cv::Mat t_cur = t_prev + R_prev * t;
+
+            auto pose_ba_done = slam_core::pose_only_ba(R_cur, t_cur, p3d, p2d, cameraMatrix);
+            
             // std::cout << "R_cur = " << R_cur << std::endl;
             // std::cout << "t_cur = " << t_cur << std::endl;
             R_cur = R_cur.t();
             t_cur = -R_cur * t_cur;
             // t_cur = slam_core::adjust_translation_magnitude(gtPoses, t_cur, idx);
 
-            
 
             cv::Mat Rc = R_cur.clone(); cv::Mat tc = t_cur.clone();
             Rc = Rc.t();

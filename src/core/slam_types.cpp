@@ -5,8 +5,8 @@ namespace slam_types {
     const float match_thr = 0.7f;
     const float map_match_thr = 0.7f;
     const int map_match_window = 20;
-    const int Full_ba_window_size = 7;
-    const int Full_ba_include_past_optimized_frame_size = 3;
+    const int Full_ba_window_size = 1;
+    const int Full_ba_include_past_optimized_frame_size = 5;
     const float mag_filter = 0.05f;
     const float rot_filter = 0.3f;
     int max_idx   = 4540;           // max 4540

@@ -820,8 +820,8 @@ namespace slam_core {
             post_ba_map_update_for_new_keyframes(R_before, t_before);
             std::cout << 10 << std::endl;
         }
-        post_ba_map_point_culling(cameraMatrix);
-        std::cout << 11 << std::endl;
+        // post_ba_map_point_culling(cameraMatrix);
+        // std::cout << 11 << std::endl;
         return true;
     }
 
@@ -974,6 +974,105 @@ namespace slam_core {
 
         }
         std::cout << "bad point size = " << culled_points << std::endl;
+    }
+
+
+    /////////////////////////////////////////////////////////////
+
+    struct PoseOnlyReprojectionError {
+        PoseOnlyReprojectionError(const cv::Point2d& observed, const cv::Mat& camera_matrix, const cv::Point3d& fixed_point)
+            : observed_(observed), camera_matrix_(camera_matrix), fixed_point_(fixed_point) {}
+
+        template <typename T>
+        bool operator()(const T* const camera,  // 6 params: angle-axis rotation + translation
+                        T* residuals) const {
+            // Camera params: camera[0,1,2] = angle-axis rotation, camera[3,4,5] = translation
+            // Assuming pose is camera-to-world: invert to get world-to-camera
+            T p_trans[3];
+            p_trans[0] = T(fixed_point_.x) - camera[3];
+            p_trans[1] = T(fixed_point_.y) - camera[4];
+            p_trans[2] = T(fixed_point_.z) - camera[5];
+
+            // Apply inverse rotation (transpose, i.e., rotate by -angle_axis)
+            T minus_camera[3] = { -camera[0], -camera[1], -camera[2] };
+            T p[3];
+            ceres::AngleAxisRotatePoint(minus_camera, p_trans, p);
+
+            // Project to normalized image coordinates
+            T xp = p[0] / p[2];
+            T yp = p[1] / p[2];
+
+            // Apply camera matrix (fx, fy, cx, cy; assuming no skew or distortion)
+            T fx = T(camera_matrix_.at<double>(0, 0));
+            T fy = T(camera_matrix_.at<double>(1, 1));
+            T cx = T(camera_matrix_.at<double>(0, 2));
+            T cy = T(camera_matrix_.at<double>(1, 2));
+
+            T predicted_x = fx * xp + cx;
+            T predicted_y = fy * yp + cy;
+
+            // Residuals
+            residuals[0] = predicted_x - T(observed_.x);
+            residuals[1] = predicted_y - T(observed_.y);
+
+            return true;
+        }
+
+        static ceres::CostFunction* Create(const cv::Point2d& observed, const cv::Mat& camera_matrix, const cv::Point3d& fixed_point) {
+            return new ceres::AutoDiffCostFunction<PoseOnlyReprojectionError, 2, 6>(
+                new PoseOnlyReprojectionError(observed, camera_matrix, fixed_point));
+        }
+
+        cv::Point2d observed_;
+        cv::Mat camera_matrix_;
+        cv::Point3d fixed_point_;  // Fixed 3D point
+    };
+
+    bool pose_only_ba(cv::Mat& R, cv::Mat& t,
+                    const std::vector<cv::Point3d>& p3d,
+                    const std::vector<cv::Point2d>& p2d,
+                    const cv::Mat& cameraMatrix) {
+        if (p3d.size() != p2d.size() || p3d.empty()) return false;
+
+        // Initialize camera parameters from input R and t
+        std::vector<double> camera_params(6);
+        cv::Mat angle_axis;
+        cv::Rodrigues(R, angle_axis);
+
+        camera_params[0] = angle_axis.at<double>(0);
+        camera_params[1] = angle_axis.at<double>(1);
+        camera_params[2] = angle_axis.at<double>(2);
+        camera_params[3] = t.at<double>(0);
+        camera_params[4] = t.at<double>(1);
+        camera_params[5] = t.at<double>(2);
+
+        ceres::Problem problem;
+
+        // Add residuals: only optimize camera, points are fixed in the cost function
+        for (size_t i = 0; i < p3d.size(); ++i) {
+            ceres::CostFunction* cost_function = PoseOnlyReprojectionError::Create(p2d[i], cameraMatrix, p3d[i]);
+            ceres::LossFunction* loss_function = new ceres::CauchyLoss(1.0);  // Or HuberLoss if preferred
+            problem.AddResidualBlock(cost_function, loss_function, camera_params.data());
+        }
+
+        ceres::Solver::Options options;
+        options.dense_linear_algebra_library_type = ceres::CUDA;
+        options.linear_solver_type = ceres::DENSE_SCHUR;  // Efficient for small problems
+        options.minimizer_progress_to_stdout = false;
+        options.max_num_iterations = 30;  // Keep it quick, adjust as needed
+        options.num_threads = 16;  // Adjust based on your system
+
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+
+        if (!summary.IsSolutionUsable()) return false;
+
+        // Update output R and t
+        cv::Mat refined_angle_axis = (cv::Mat_<double>(3,1) << camera_params[0], camera_params[1], camera_params[2]);
+        cv::Rodrigues(refined_angle_axis, R);
+        t = (cv::Mat_<double>(3,1) << camera_params[3], camera_params[4], camera_params[5]);
+
+        return true;
     }
 
 }

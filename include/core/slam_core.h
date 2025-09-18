@@ -68,4 +68,9 @@ namespace slam_core {
 
     void post_ba_map_point_culling(cv::Mat& cameraMatrix);
 
+    bool pose_only_ba(cv::Mat& R, cv::Mat& t,
+                    const std::vector<cv::Point3d>& p3d,
+                    const std::vector<cv::Point2d>& p2d,
+                    const cv::Mat& cameraMatrix);
+
 }
