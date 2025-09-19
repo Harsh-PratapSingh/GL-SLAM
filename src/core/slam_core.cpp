@@ -255,6 +255,35 @@ namespace slam_core {
 
         }
 
+    ////////////////////////////////////////////////////////////////
+
+    void update_covisibility(Frame& current_frame, const std::vector<int>& covisible_mpids)
+    {
+        std::unordered_map<int, int> observer_counts;  // kf_id -> shared count
+
+        // Tally observers from updated map points (avoid self and duplicates)
+        for (int mpid : covisible_mpids) {
+            const auto& mp = slam_types::map.map_points[mpid];  // Access global map
+            for (const auto& ob : mp.obs) {  // Assuming obs is vector<int> of kf_ids (adapt if needed)
+                int obs_kfid = ob.keyframe_id;
+                if (obs_kfid != current_frame.id) {
+                    observer_counts[obs_kfid]++;
+                }
+            }
+        }
+
+        // Add to covisibles (bidirectional)
+        for (const auto& [kf_id, count] : observer_counts) {
+            bool added1 = current_frame.add_covisible_keyframe(kf_id, count, slam_types::covisible_edge_threshold);
+            // Bidirectional: Add to the other frame (access via global map)
+            if (added1 && slam_types::map.keyframes.count(kf_id)) {
+                slam_types::map.keyframes[kf_id].add_covisible_keyframe(current_frame.id, count, slam_types::covisible_edge_threshold);
+            }
+        }
+    }
+
+    //////////////////////////////////////////////////////
+
     void update_map_and_keyframe_data(Map& map, cv::Mat& img, cv::Mat& R, cv::Mat t,
         SuperPointTRT::Result& Result, std::vector<cv::Point3d>& points3d,
         std::vector<Match2D2D>& filteredPairs, SuperPointTRT::Result& f_res,
@@ -321,6 +350,10 @@ namespace slam_core {
             map.keyframes[frame.id] = frame;
         }
 
+        ///////////////////////////////////////////
+        std::vector<int> covisible_mpids;
+        /////////////////////////////////////////
+
         //update map point data
         // if(if_first_frame){
         //     map.keyframes[frame.id-1].kp_to_mpid.assign(map.keyframes[frame.id-1].sp_res.keypoints.size()/2, -1);
@@ -355,9 +388,12 @@ namespace slam_core {
 
             map.map_points[mp.id] = mp;
             if(unoptimized) slam_types::mpid_to_correct.push_back(mp.id);
+
+            /////////////////////////////////////////
+            covisible_mpids.push_back(mp.id);
             
         }
-        
+
         int obs1 =0 ;
         if(!obsPairs.empty() && !if_first_frame){
             for(const auto& m : obsPairs){
@@ -369,14 +405,23 @@ namespace slam_core {
                 map.keyframes[frame.id].map_point_ids.push_back(m.mpid);
                 map.map_points[m.mpid].obs.push_back(obs);
                 ++obs1;
+
+                /////////////////
+                covisible_mpids.push_back(m.mpid);
             }
             
         }
+
+        ////////////////////////////////////////
+        update_covisibility(map.keyframes[frame.id], covisible_mpids);
+        ////////////////////////////////////////
+
         if(unoptimized) slam_types::kpid_to_correct.push_back(frame.id);
 
         std::cout << "Updated " << obs1 << " for frame " << frame.id << " observations" << std::endl;
         std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
               << map.keyframes.size() << " KeyFrames." << std::endl;
+        std::cout << "Covisible Frames = " << map.keyframes[frame.id].CovisibleKeyframes.size() << std::endl;
 
     }
 
@@ -643,7 +688,9 @@ namespace slam_core {
         std::cerr << "[PnP-Loop] PnP inliers at frame " << idx << " = " << (int)inliers_pnp.size() << " , " << map_point_id.size()  << "\n";
 
         return std::make_tuple(img_cur, R_cur, t_cur, spRes_cur, restPairs, obsPairs, skip);
-    }   
+    }  
+    
+    //////////////////////////////////////////////////////////////////
 
     struct ReprojectionError {
         ReprojectionError(const cv::Point2d& observed, const cv::Mat& camera_matrix)
@@ -820,8 +867,11 @@ namespace slam_core {
             post_ba_map_update_for_new_keyframes(R_before, t_before);
             std::cout << 10 << std::endl;
         }
-        post_ba_map_point_culling(cameraMatrix);
-        std::cout << 11 << std::endl;
+        if(slam_types::cull_map_points)
+        {
+            post_ba_map_point_culling(cameraMatrix);
+            std::cout << 11 << std::endl;
+        }
         return true;
     }
 
@@ -853,6 +903,8 @@ namespace slam_core {
         dR_out = dR.clone();
         dt_out = dt.clone();
     }
+
+    ////////////////////////////////////////////////////////////////
 
     void post_ba_map_update_for_new_keyframes(cv::Mat& R_before, cv::Mat& t_before)
     {
@@ -912,6 +964,8 @@ namespace slam_core {
         
         std::cout << "DONE" << std::endl;
     }
+
+    //////////////////////////////////////////////////////////////////
 
     void post_ba_map_point_culling(cv::Mat& cameraMatrix)
     {
@@ -1074,5 +1128,8 @@ namespace slam_core {
 
         return true;
     }
+
+
+
 
 }

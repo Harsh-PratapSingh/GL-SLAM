@@ -1,5 +1,6 @@
 #include "threading/thread_pool.h"
 
+
 namespace thread_pool {
 
     auto img_name = [](int idx) {
@@ -170,7 +171,10 @@ namespace thread_pool {
             cv::Mat R_cur = R_prev * R;
             cv::Mat t_cur = t_prev + R_prev * t;
 
-            auto pose_ba_done = slam_core::pose_only_ba(R_cur, t_cur, p3d, p2d, cameraMatrix);
+            if(slam_types::run_pose_ba)
+            {
+                auto pose_ba_done = slam_core::pose_only_ba(R_cur, t_cur, p3d, p2d, cameraMatrix);
+            }
             
             // std::cout << "R_cur = " << R_cur << std::endl;
             // std::cout << "t_cur = " << t_cur << std::endl;

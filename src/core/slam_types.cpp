@@ -11,6 +11,10 @@ namespace slam_types {
     const float rot_filter = 0.3f;
     int max_idx   = 4540;           // max 4540
 
+    bool run_pose_ba = true;
+    bool cull_map_points = true;
+    int covisible_edge_threshold = 50;
+
     int run_window = -1;
 
     Map map;
@@ -27,8 +31,6 @@ namespace slam_types {
     Keypt2SubpxTRT ks;
 
     std::condition_variable cv_local_ba; 
-    std::condition_variable run_tracking;
-    bool tracking_frame = true;   
     bool local_ba_start = false; 
     int local_ba_window = 0;
     bool local_ba_done = false; 
@@ -38,5 +40,7 @@ namespace slam_types {
 
     std::vector<int> mpid_to_correct;
     std::vector<int> kpid_to_correct;
+
+    
 
 }

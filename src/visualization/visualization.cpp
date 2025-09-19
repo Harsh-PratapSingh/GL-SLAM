@@ -92,9 +92,9 @@ namespace slam_visualization {
                     Rcw.copyTo(T(cv::Rect(0,0,3,3)));
                     tcw.copyTo(T(cv::Rect(3,0,1,3)));
 
-                    float sz = 1.0f;
+                    float sz = 0.5f;
                     if(kf.id == 0){
-                        sz = 2.0f;
+                        sz = 1.0f;
                     }
                     
                     glLineWidth(3);
@@ -109,6 +109,52 @@ namespace slam_visualization {
                     glEnd();
                 }
             }
+
+            // After drawing keyframe axes, add this for covisible lines
+            glLineWidth(1.0f);  // Thin lines
+            glColor3f(0.5f, 0.5f, 0.5f);  // Gray for covisibility edges
+            glBegin(GL_LINES);
+
+            for (const auto& kv : map.keyframes) {
+                const auto& kf = kv.second;
+                
+                // Compute world position (ox, oy, oz from your existing T calculation)
+                cv::Mat Rcw = kf.R;  // Transpose R (as in your code)
+                cv::Mat tcw = kf.t;
+                cv::Mat T = cv::Mat::eye(4, 4, CV_64F);
+                Rcw.copyTo(T(cv::Rect(0, 0, 3, 3)));
+                tcw.copyTo(T(cv::Rect(3, 0, 1, 3)));
+                
+                double ox = T.at<double>(0, 3);
+                double oy = T.at<double>(1, 3);
+                double oz = T.at<double>(2, 3);
+                
+                // Draw line to each covisible keyframe
+                for (const auto& cov : kf.CovisibleKeyframes) {
+                    auto it = map.keyframes.find(cov.keyframe_id);
+                    if (it != map.keyframes.end()) {
+                        const auto& kf2 = it->second;
+                        
+                        // Compute kf2 position similarly
+                        cv::Mat Rcw2 = kf2.R;
+                        cv::Mat tcw2 = kf2.t;
+                        cv::Mat T2 = cv::Mat::eye(4, 4, CV_64F);
+                        Rcw2.copyTo(T2(cv::Rect(0, 0, 3, 3)));
+                        tcw2.copyTo(T2(cv::Rect(3, 0, 1, 3)));
+                        
+                        double ox2 = T2.at<double>(0, 3);
+                        double oy2 = T2.at<double>(1, 3);
+                        double oz2 = T2.at<double>(2, 3);
+                        
+                        // Draw line between (ox, oy, oz) and (ox2, oy2, oz2)
+                        glVertex3d(ox, oy, oz);
+                        glVertex3d(ox2, oy2, oz2);
+                    }
+                }
+            }
+
+            glEnd();
+
 
             pangolin::FinishFrame();
             std::this_thread::sleep_for(std::chrono::milliseconds(5));

@@ -58,12 +58,6 @@ namespace slam_core {
 
     bool full_ba(std::mutex& map_mutex, Map& map, cv::Mat& cameraMatrix, int window);
 
-    cv::Mat ProjectToSO3(const cv::Mat& R_in);
-
-    void ComputeDeltaPose_SO3(const cv::Mat& Rb_in, const cv::Mat& tb,
-                                    const cv::Mat& Ra_in, const cv::Mat& ta,
-                                    cv::Mat& dR_out, cv::Mat& dt_out);
-
     void post_ba_map_update_for_new_keyframes(cv::Mat& R_before, cv::Mat& t_before);
 
     void post_ba_map_point_culling(cv::Mat& cameraMatrix);

@@ -5,6 +5,11 @@
 #include <core/keypt2subpx.h>
 #include <condition_variable>
 
+struct CovisibleKeyframe {
+    int keyframe_id;
+    int shared_map_points;
+};
+
 struct Observation {
     int keyframe_id;
     cv::Point2d point2D;
@@ -32,6 +37,20 @@ struct Frame {
     std::vector<int> map_point_ids;
     std::vector<int> kp_to_mpid;    
     bool is_keyframe = false;
+
+    std::vector<CovisibleKeyframe> CovisibleKeyframes;
+
+    // Helper to add without duplicates (weight immutable)
+    bool add_covisible_keyframe(int kf_id, int shared_count, int threshold = 150) {
+        if (shared_count <= threshold) return false;
+        for (const auto& ckf : CovisibleKeyframes) {
+            if (ckf.keyframe_id == kf_id) {
+                return false;  // Duplicate, skip (no weight update)
+            }
+        }
+        CovisibleKeyframes.push_back({kf_id, shared_count});
+        return true;
+    }
 };
 
 struct Map {
@@ -55,7 +74,6 @@ struct ObsPairs {
     cv::Point2d p1;
 };
 
-
 struct SyntheticMatch {
     int idx_curr_frame;
     int mpid;
@@ -72,6 +90,10 @@ namespace slam_types {
     extern const float rot_filter;
     extern int max_idx;   
     extern int run_window;   
+    extern int covisible_edge_threshold;
+
+    extern bool run_pose_ba;
+    extern bool cull_map_points;
 
     extern Map map;
     extern std::mutex map_mutex; 
@@ -87,8 +109,6 @@ namespace slam_types {
     extern Keypt2SubpxTRT ks;
 
     extern std::condition_variable cv_local_ba;     
-    extern std::condition_variable run_tracking; 
-    extern bool tracking_frame;
     extern bool local_ba_start; 
     extern int local_ba_window;
     extern bool local_ba_done; 
@@ -98,5 +118,7 @@ namespace slam_types {
 
     extern std::vector<int> mpid_to_correct;
     extern std::vector<int> kpid_to_correct;
+
+    
 }
 
