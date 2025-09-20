@@ -67,4 +67,8 @@ namespace slam_core {
                     const std::vector<cv::Point2d>& p2d,
                     const cv::Mat& cameraMatrix);
 
+    std::tuple<std::vector<int>,std::unordered_set<int>> get_covisible_keyframes(const std::vector<Match2D2D>& matches, int N1, int N2, int k2_top_n_per_k1);
+    std::vector<int> extract_mpids_from_covisible_keyframes(const std::vector<int>& covisible_kpids, const std::unordered_set<int>& seed_mpids, int max_mpids);
+    SuperPointTRT::Result project_mpids_to_current(const std::vector<int>& unique_mpids, cv::Mat&cameraMatrix ,const cv::Mat& Rc, const cv::Mat& tc);
+
 }

@@ -422,7 +422,7 @@ namespace slam_core {
         std::cout << "Map contains " << map.map_points.size() << " MapPoints and "
               << map.keyframes.size() << " KeyFrames." << std::endl;
         std::cout << "Covisible Frames = " << map.keyframes[frame.id].CovisibleKeyframes.size() << std::endl;
-
+        std::cout << "Desciptor Size = " << map.keyframes[frame.id].sp_res.descriptors.size() << std::endl;
     }
 
     std::unordered_map<int, SyntheticMatch> get_matches_from_previous_frames(
@@ -742,14 +742,18 @@ namespace slam_core {
     };
 
     bool full_ba(std::mutex& map_mutex, Map& map, cv::Mat& cameraMatrix, int window){
-        if(map.keyframes.size() < window || window == 1) return false;
+        // std::unique_lock<std::mutex> lock(map_mutex);
+        if(map.keyframes.size() < window || window == 1) {
+            // lock.unlock();
+            return false;
+        }
         std::vector<double> camera_params;
         std::vector<double> point_params;
         std::unordered_map<int, int> kf_to_param_idx;
         int cam_param_size = 6;  // angle-axis (3) + translation (3)
 
         // Collect and convert camera poses
-        // std::unique_lock<std::mutex> lock(map_mutex);
+        
         std::cout << 1 << std::endl;
         int first_frame_idx = slam_types::run_window + 1 - window;
         for(int i = first_frame_idx; i < first_frame_idx + window; ++i){
@@ -832,11 +836,13 @@ namespace slam_core {
             // auto* subset = new ceres::SubsetParameterization(6, fixed);
             // problem.SetParameterization(&camera_params[anchor_cam_idx * cam_param_size], subset);
         }
+        // lock.unlock();
+
         std::cout << 6 << std::endl;
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::SPARSE_SCHUR;  // Or SPARSE_SCHUR for larger problems
         options.preconditioner_type = ceres::CLUSTER_JACOBI;
-        options.minimizer_progress_to_stdout = true;
+        options.minimizer_progress_to_stdout = false;
         options.max_num_iterations = 30; // increase from default ~50
         options.num_threads = 8;  // Adjust to your CPU cores (e.g., std::thread::hardware_concurrency())
         ceres::Solver::Summary summary;
@@ -866,12 +872,13 @@ namespace slam_core {
             std::cout << 9 << std::endl;
             post_ba_map_update_for_new_keyframes(R_before, t_before);
             std::cout << 10 << std::endl;
+            if(slam_types::cull_map_points)
+            {
+                post_ba_map_point_culling(cameraMatrix);
+                std::cout << 11 << std::endl;
+            }
         }
-        if(slam_types::cull_map_points)
-        {
-            post_ba_map_point_culling(cameraMatrix);
-            std::cout << 11 << std::endl;
-        }
+        
         return true;
     }
 
@@ -1119,6 +1126,9 @@ namespace slam_core {
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
+        // std::cout << summary.FullReport() << std::endl;
+
+
         if (!summary.IsSolutionUsable()) return false;
 
         // Update output R and t
@@ -1129,7 +1139,205 @@ namespace slam_core {
         return true;
     }
 
+    // Parameters:
+    // - matches: Input 2D-2D matches (seed correspondences)
+    // - N1: Max K1 after culling (e.g., 20)
+    // - N2: Max total K2 after global culling (e.g., 50)
+    // - k2_top_n_per_k1: Top neighbors per K1 (e.g., 5)
+    // - edge_weight_thresh: Min weight for K2 candidates (e.g., 15)
 
+    std::tuple<std::vector<int>,std::unordered_set<int>> get_covisible_keyframes(const std::vector<Match2D2D>& matches, int N1, int N2, int k2_top_n_per_k1) {
+        // Step 1: Extract unique seed mpids from matches (assuming idx1 is mpid; adapt if needed)
+        std::unordered_set<int> seed_mpids;
+        const auto& prev_kf = slam_types::map.keyframes[slam_types::map.next_keyframe_id - 1];
+        for (const auto& m : matches) {
+            int mpid = prev_kf.kp_to_mpid[m.idx0];
+            if(mpid > -1) seed_mpids.insert(mpid);  // Or use map_point_ids if not direct
+        }
+
+        // Step 2: Tally observers for K1 candidates
+        std::unordered_map<int, int> observer_counts;  // kf_id -> count
+        for (int mpid : seed_mpids) {
+            const auto& mp = slam_types::map.map_points[mpid];
+            for (const auto& obs : mp.obs) {
+                observer_counts[obs.keyframe_id]++;
+            }
+        }
+
+        std::cout << "K1 Candidates = " << observer_counts.size() << std::endl;
+
+        // Step 3: Cull K1 to top N1 by count
+        std::vector<std::pair<int, int>> sorted_k1(observer_counts.begin(), observer_counts.end());
+        std::sort(sorted_k1.begin(), sorted_k1.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+        std::vector<int> culled_k1;
+        for (int i = 0; i < std::min(N1, static_cast<int>(sorted_k1.size())); ++i) {
+                culled_k1.push_back(sorted_k1[i].first);
+        }
+
+        std::cout << "K1 Culled = " << culled_k1.size() << std::endl;
+
+        // Step 4: Retrieve and cull K2
+        std::unordered_set<int> k2_candidates;  // For dedup
+        std::vector<std::pair<int, int>> weighted_k2;  // (kf_id, weight) for global sort
+        for (int k1_id : culled_k1) {
+            const auto& kf = slam_types::map.keyframes[k1_id];
+            std::vector<std::pair<int, int>> neighbors;
+            for (const auto& cov : kf.CovisibleKeyframes) {
+                neighbors.emplace_back(cov.keyframe_id, cov.shared_map_points);
+            }
+
+            // Sort neighbors by weight descending
+            std::sort(neighbors.begin(), neighbors.end(), [](const auto& a, const auto& b) {
+                return a.second > b.second;
+            });
+            // Iterate through all sorted neighbors, add until we reach k2_top_n_per_k1 unique added for this K1
+            int added_for_k1 = 0;
+            for (const auto& neigh : neighbors) {
+                int neigh_id = neigh.first;
+                if (std::find(culled_k1.begin(), culled_k1.end(), neigh_id) == culled_k1.end() &&
+                    k2_candidates.insert(neigh_id).second) {
+                    weighted_k2.emplace_back(neigh_id, neigh.second);
+                    added_for_k1++;
+                    if (added_for_k1 >= k2_top_n_per_k1) {
+                        break;  // Stop once we have added k2_top_n_per_k1 for this K1
+                    }
+                }
+            }
+        }
+
+        std::cout << "K2 Candidates = " << k2_candidates.size() << std::endl;
+
+
+        // Global cull K2 to top N2 by weight
+        std::sort(weighted_k2.begin(), weighted_k2.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+        std::vector<int> culled_k2;
+        for (int i = 0; i < std::min(N2, static_cast<int>(weighted_k2.size())); ++i) {
+            culled_k2.push_back(weighted_k2[i].first);
+        }
+
+        std::cout << "K2 Culled = " << culled_k2.size() << std::endl;
+
+
+        // Step 5: Union K1 + K2 (unique)
+        std::vector<int> result = culled_k1;
+        result.insert(result.end(), culled_k2.begin(), culled_k2.end());
+
+        std::cout << "K1 + K2 = " << result.size() << std::endl;
+
+        return std::make_tuple(result, seed_mpids);
+    }
+
+    std::vector<int> extract_mpids_from_covisible_keyframes(const std::vector<int>& covisible_kpids, const std::unordered_set<int>& seed_mpids, int max_mpids)
+    {
+        std::unordered_set<int> unique_mpids;
+        for (int kpid : covisible_kpids) {
+            const auto& kf = slam_types::map.keyframes[kpid];
+            for (int mpid : kf.map_point_ids) {
+                if(seed_mpids.find(mpid) == seed_mpids.end() && !slam_types::map.map_points[mpid].is_bad) {
+                    unique_mpids.insert(mpid);
+                }
+                if (static_cast<int>(unique_mpids.size()) >= max_mpids) break;
+            }
+        }
+        return std::vector<int>(unique_mpids.begin(), unique_mpids.end());
+    }
+
+    // Add this function to your tracking or mapping file (e.g., in slam_types.cpp or a helper).
+    // It takes unique_mpids, current R (rotation matrix, 3x3), t (translation vector, 3x1),
+    // and projects mpids' 3D positions to 2D keypoints in the current image plane.
+    // For each valid projection, selects the "best" descriptor from observations (e.g., from closest keyframe).
+    // Assumes global camera matrix K (intrinsics) in slam_types::camera_matrix (cv::Mat 3x3).
+    // Filters: In front of camera, within image bounds (pass width/height).
+    // Returns SuperPointTRT::Result with projected keypoints, scores (placeholder), descriptors.
+
+    SuperPointTRT::Result project_mpids_to_current(const std::vector<int>& unique_mpids, cv::Mat&cameraMatrix , const cv::Mat& Rc, const cv::Mat& tc) {
+        SuperPointTRT::Result result;
+        result.keypoints.reserve(unique_mpids.size() * 2);
+        result.scores.reserve(unique_mpids.size());
+        result.descriptors.reserve(unique_mpids.size() * 256);
+        result.numValid = 0;
+
+        cv::Mat K = cameraMatrix;  // Assume global 3x3 intrinsics; adapt if needed
+        cv::Mat R = Rc.clone();
+        cv::Mat t = tc.clone();
+        R = R.t();
+        t = -R * t;
+
+        int img_width = 1241;
+        int img_height = 376;
+
+        for (int mpid : unique_mpids) {
+            const auto& mp = slam_types::map.map_points[mpid];
+            
+            if (mp.is_bad) continue;
+            // std::cout << " 1 " << std::endl;
+            // Step 1: Project 3D point to camera coordinates
+            cv::Mat P_world = (cv::Mat_<double>(4, 1) << mp.position.x, mp.position.y, mp.position.z, 1.0);
+            cv::Mat Rt = cv::Mat::eye(4, 4, CV_64F);
+            R.copyTo(Rt(cv::Rect(0, 0, 3, 3)));  // Assuming R is world-to-camera rotation
+            t.copyTo(Rt(cv::Rect(3, 0, 1, 3)));
+            cv::Mat P_cam = Rt * P_world;
+
+            if (P_cam.at<double>(2) <= 0) continue;  // Behind camera
+            // std::cout << " 2 " << std::endl;
+            // Step 2: Project to 2D pixel (normalized then apply K)
+            cv::Mat uv_norm = (cv::Mat_<double>(3, 1) << P_cam.at<double>(0) / P_cam.at<double>(2),
+                                                        P_cam.at<double>(1) / P_cam.at<double>(2), 1.0);
+            cv::Mat uv = K * uv_norm;
+            double x = uv.at<double>(0), y = uv.at<double>(1);
+
+            // Filter bounds
+            if (x < 0 || x >= img_width || y < 0 || y >= img_height) continue;
+            // std::cout << " 3 " << std::endl;
+            // Step 3: Choose best descriptor from observations (e.g., closest keyframe to current pose)
+            int obs_i = 0;
+            int best_obs = -1;
+            double best_dist = -1;
+            for (const auto& obs : mp.obs) {
+                const auto& kf = slam_types::map.keyframes[obs.keyframe_id];
+                // std::cout << " 4 " << std::endl;
+
+                // Compute distance between kf pose and current (e.g., translation diff)
+                cv::Mat dist_vec = kf.t - t;
+                double dist = cv::norm(dist_vec);  // Euclidean distance
+
+                if (dist < best_dist || best_dist == -1) {
+                    best_dist = dist;
+                    best_obs = obs_i;
+                }
+                obs_i++;
+            }
+
+            if (best_obs < 0) continue;
+            // std::cout << " 5 " << std::endl;
+
+            // Get descriptor from best observation
+            const float* desc_ptr = nullptr;
+            const auto& obs = mp.obs[best_obs];
+            const auto& kf = slam_types::map.keyframes[obs.keyframe_id];
+            if (obs.kp_index >= 0 && obs.kp_index * 256 < kf.sp_res.descriptors.size()) {
+                desc_ptr = &kf.sp_res.descriptors[obs.kp_index * 256];
+                // std::cout << " 6 " << std::endl;
+            }
+            if (desc_ptr == nullptr) continue;
+            // std::cout << " 7 " << std::endl;
+            // Step 4: Append to result
+            result.keypoints.push_back(static_cast<int64_t>(x));
+            result.keypoints.push_back(static_cast<int64_t>(y));
+            result.scores.push_back(mpid);  // Placeholder; use real score if available (e.g., from SuperPoint)
+            result.descriptors.insert(result.descriptors.end(), desc_ptr, desc_ptr + 256);
+            result.numValid++;
+
+            // std::cout << " 8 " << std::endl;
+
+        }
+
+        return result;
+    }
 
 
 }

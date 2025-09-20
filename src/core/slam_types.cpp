@@ -14,6 +14,10 @@ namespace slam_types {
     bool run_pose_ba = true;
     bool cull_map_points = true;
     int covisible_edge_threshold = 50;
+    int k1_threshold = 20;
+    int k2_threshold = 50;
+    int k1_neighbor_threshold = 5;
+    int max_mpids_to_extract_threshold = 2048;
 
     int run_window = -1;
 

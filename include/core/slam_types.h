@@ -91,6 +91,10 @@ namespace slam_types {
     extern int max_idx;   
     extern int run_window;   
     extern int covisible_edge_threshold;
+    extern int k1_threshold;
+    extern int k2_threshold;
+    extern int k1_neighbor_threshold;
+    extern int max_mpids_to_extract_threshold;
 
     extern bool run_pose_ba;
     extern bool cull_map_points;
